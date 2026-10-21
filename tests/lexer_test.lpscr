@@ -1,0 +1,77 @@
+@mode(host.scripted)
+
+# Unit tests for crudini's line scanner (lib/lexer.lpscr): every line kind,
+# the offsets of a parameter's parts, inline comments and indentation.
+#
+# Runtime: host.scripted, run by the test runner: `make test` interprets
+# this file with Stage0 (`loup-bootstrap test --no-parallel --file`), one
+# test per `func test_*()`. It imports lib/ with relative imports
+# (`from ..lib.lexer`). It is not part of the program.
+
+from debug.assert import (expect, expectEq);
+from ..lib.lexer import (LineKind, LineToken, scan_line);
+
+func kind_of(line: string): LineKind {
+    return scan_line(line, false, false).kind;
+}
+
+func test_kinds(): void {
+    expect(kind_of("") == LineKind.Blank, "empty");
+    expect(kind_of(" \t ") == LineKind.Blank, "spaces");
+    expect(kind_of("# note") == LineKind.Comment, "hash");
+    expect(kind_of("; note") == LineKind.Comment, "semicolon");
+    expect(kind_of("%include other.rc") == LineKind.Comment, "percent");
+    expect(kind_of("[db]") == LineKind.Header, "header");
+    expect(kind_of("[db]  ; main database") == LineKind.Header, "header with comment");
+    expect(kind_of("port = 1") == LineKind.Param, "param");
+    expect(kind_of("skip-name-resolve") == LineKind.Flag, "flag");
+}
+
+func test_invalid_lines(): void {
+    expect(kind_of("[db") == LineKind.Invalid, "unclosed header");
+    expect(kind_of("[]") == LineKind.Invalid, "empty name");
+    expect(kind_of("[db] trailing") == LineKind.Invalid, "text after header");
+    expect(kind_of("= 1") == LineKind.Invalid, "no name");
+    expect(kind_of("  x = 1") == LineKind.Invalid, "indented with nothing to continue");
+}
+
+func test_param_parts(): void {
+    let tok = scan_line("Port   =  8080", false, false);
+    expectEq(tok.name(), "Port", "name");
+    expectEq(tok.separator(), "   =  ", "separator keeps its spaces");
+    expectEq(tok.value(), "8080", "value");
+    expectEq(tok.comment(), "", "no comment");
+    let colon = scan_line("url: http://h:80/x=1", false, false);
+    expectEq(colon.name(), "url", "the first delimiter wins");
+    expectEq(colon.value(), "http://h:80/x=1", "later delimiters are value");
+    let empty = scan_line("key =   ", false, false);
+    expectEq(empty.value(), "", "empty value");
+}
+
+func test_inline_comments(): void {
+    let tok = scan_line("host = a  ; primary", false, false);
+    expectEq(tok.value(), "a", "value before the comment");
+    expectEq(tok.comment(), "; primary", "comment from its ;");
+    expectEq(tok.comment_start, 10, "comment column");
+    expectEq(scan_line("url = a;b", false, false).value(), "a;b", "no space before ;");
+    expectEq(scan_line("x = a;b ;c", false, false).value(), "a;b ;c", "only the first ; counts");
+    expectEq(scan_line("x = # not a comment", false, false).value(), "# not a comment", "# is value text");
+}
+
+func test_headers(): void {
+    let tok = scan_line("[web server]", false, false);
+    expectEq(tok.name(), "web server", "name with a space");
+    expectEq(scan_line("[ spaced ]", false, false).name(), " spaced ", "name kept as written");
+}
+
+func test_continuation_and_indent(): void {
+    let tok = scan_line("    second line  ", true, false);
+    expect(tok.kind == LineKind.Continuation, "after a parameter");
+    expectEq(tok.value(), "second line", "text without indent");
+    let ignored = scan_line("    x = 1", true, true);
+    expect(ignored.kind == LineKind.Param, "ignoreindent: a parameter");
+    expectEq(ignored.indent(), "    ", "indent kept");
+    expectEq(ignored.name(), "x", "name after the indent");
+    expect(scan_line("  [sub]", false, true).kind == LineKind.Header, "ignoreindent: indented header");
+    expect(scan_line("\t# note", false, true).kind == LineKind.Comment, "ignoreindent: indented comment");
+}

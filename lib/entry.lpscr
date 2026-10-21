@@ -1,0 +1,188 @@
+@mode(host.scripted)
+
+# crudini's parameter: one `name = value` line of a section, with its inline
+# comment and the continuation lines that belong to its value.
+#
+# Runtime: host.scripted. A module of the script bin/crudini.lpscr,
+# interpreted with it by `loup run`; the unit tests import it under Stage0's
+# test runner (`loup-bootstrap test --no-parallel --file`).
+#
+# Structure: an Entry keeps the line it was read from and renders it
+# unchanged until assign() or restyle() edits it; then it rebuilds the line
+# from its parts, keeping the indent and the column of an inline comment.
+# Its section is a weak back-pointer: the Section owns its entries, and an
+# entry only needs to find its way back (to name its section or remove
+# itself) without keeping the section alive.
+
+# Entry and Section refer to each other. Deferring this import lets the two
+# modules load in either order: the name is resolved when it is first used.
+from .section defer import (Section);
+from .lexer import (COMMENT_CHARS, LineKind, LineToken, is_space);
+
+# Continuation lines of a new multi-line value are indented this much when
+# the entry has no continuation line to copy the indent from (iniparse's
+# default).
+const CONTINUATION_INDENT: string = "        ";
+
+pub class Entry {
+    pub let name: string;
+    pub let indent: string;
+    # Between name and value, spaces included: " = ", "=", ": ". Unused by
+    # a flag (a name with no value, like `skip-name-resolve`).
+    pub var separator: string;
+    pub var value: string;
+    pub var flag: bool;
+    # An inline comment from its `;` on, and the column it started in.
+    pub var comment: string = "";
+    pub var comment_column: int = -1;
+    # The lines after the parameter line that belong to it, verbatim:
+    # indented continuation lines and the blank or comment lines among them.
+    pub var continuation: list[string] = [];
+    # The parameter line as read ("" for a new entry) and whether it must be
+    # rebuilt from the fields when rendered.
+    pub var original: string = "";
+    pub var edited: bool = true;
+    pub weak var section: Section?;
+
+    new(name: string, indent: string, separator: string, value: string, flag: bool) {
+        this.name = name;
+        this.indent = indent;
+        this.separator = separator;
+        this.value = value;
+        this.flag = flag;
+        this.section = None;
+    }
+
+    # Parameter names match case-insensitively, as in ConfigParser.
+    pub get key(): string {
+        return this.name.toLowerCase();
+    }
+
+    # The value as --get prints it: the first line, then each continuation
+    # line without its indent. Blank and comment lines inside a value are
+    # left out, as ConfigParser does.
+    pub get full_value(): string {
+        var parts: list[string] = [this.value];
+        for (line in this.continuation) {
+            let text = line.trim();
+            if (text != "" and !COMMENT_CHARS.contains(line.slice(0, 1))) {
+                parts.push(text);
+            }
+        }
+        return parts.join("\n");
+    }
+
+    # Gives the entry a new value. The first line stays on the parameter
+    # line; the others become continuation lines, indented like the entry's
+    # existing ones. A flag that gets a value is written with `separator`.
+    pub modifier func assign(value: string, separator: string): void {
+        var pad = CONTINUATION_INDENT;
+        for (line in this.continuation) {
+            if (line.trim() != "" and is_space(line.slice(0, 1))) {
+                pad = line.slice(0, line.len() - line.trimStart().len());
+                break;
+            }
+        }
+        let lines = value.split("\n");
+        var rest: list[string] = [];
+        for (k in 1..lines.len()) {
+            if (lines[k].trim() == "") {
+                rest.push("");
+            } else {
+                rest.push(pad + lines[k]);
+            }
+        }
+        if (this.flag) {
+            this.flag = false;
+            this.separator = separator;
+        }
+        this.value = lines[0];
+        this.continuation = rest;
+        this.edited = true;
+    }
+
+    # Writes the separator with spaces around the delimiter, or without
+    # (--ini-options=space / nospace), keeping `=` or `:`.
+    pub modifier func restyle(spaced: bool): void {
+        if (this.flag) {
+            return;
+        }
+        let delimiter = this.separator.trim();
+        let wanted = if (spaced) { " " + delimiter + " " } else { delimiter };
+        if (wanted != this.separator) {
+            # crudini rewrites the line before parsing it, so an inline
+            # comment moves along with the text before it.
+            if (this.comment_column >= 0) {
+                this.comment_column += wanted.len() - this.separator.len();
+            }
+            this.separator = wanted;
+            this.edited = true;
+        }
+    }
+
+    # The lines of this entry as they go into the file.
+    pub func render(): list[string] {
+        var first = this.original;
+        if (this.edited) {
+            first = this.indent + this.name;
+            if (!this.flag) {
+                first = first + this.separator + this.value;
+            }
+            if (this.comment != "") {
+                # Keep the comment in its column when the new text leaves
+                # room for it, as iniparse does.
+                first = first + " ";
+                while (first.len() < this.comment_column) {
+                    first = first + " ";
+                }
+                first = first + this.comment;
+            }
+        }
+        var out: list[string] = [first];
+        for (line in this.continuation) {
+            out.push(line);
+        }
+        return out;
+    }
+
+    # The name of the section this entry is in, through the back-pointer.
+    pub func section_name(): string {
+        match this.section {
+            Some(owner) => {
+                return owner.name;
+            },
+            None => {
+                return "";
+            },
+        }
+    }
+
+    # Removes this entry from its section. False when it is in none.
+    pub func detach(): bool {
+        match this.section {
+            Some(owner) => {
+                var removed = false;
+                safe {
+                    removed = owner.remove_entry(this);
+                }
+                return removed;
+            },
+            None => {
+                return false;
+            },
+        }
+    }
+}
+
+# The Entry for a parameter or flag line the scanner found: it renders as
+# the line it came from until it is edited.
+pub func entry_from_token[lifetime ~a](tok: LineToken[~a]): Entry {
+    let entry = Entry(tok.name(), tok.indent(), tok.separator(), tok.value(), tok.kind == LineKind.Flag);
+    safe {
+        entry.comment = tok.comment();
+        entry.comment_column = tok.comment_start;
+        entry.original = tok.line();
+        entry.edited = false;
+    }
+    return entry;
+}

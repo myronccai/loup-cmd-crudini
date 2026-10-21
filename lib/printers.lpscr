@@ -1,0 +1,152 @@
+@mode(host.scripted)
+
+# crudini's --get output formats: plain (the default), ini, lines and sh.
+#
+# Runtime: host.scripted. A module of the script bin/crudini.lpscr,
+# interpreted with it by `loup run`; the unit tests import it under Stage0's
+# test runner (`loup-bootstrap test --no-parallel --file`).
+#
+# Structure: the same class hierarchy as crudini's Print classes. Printer
+# writes a section header and a name/value pair; each format overrides the
+# two methods, and IniNoSpacePrinter only changes IniPrinter's separator.
+# The editor calls them with `name` or `value` absent (None) where crudini
+# passes None: a plain listing of names, or an empty section in `lines`.
+
+from data.ini import (stringify);
+from core.shlex import (quote);
+from .errors import (ShIdentifierError);
+
+pub class Printer {
+    pub func section_header(section: string): string {
+        return section;
+    }
+
+    # The plain format prints the name when there is one (a listing of a
+    # section), else the value.
+    pub func name_value(name: string?, value: string?, section: string?): string {
+        match name {
+            Some(text) => {
+                return text;
+            },
+            None => {
+                return value ?? "";
+            },
+        }
+    }
+
+    # The printer for a --format value ("" is the plain format).
+    pub static func for_format(format: string, nospace: bool): Printer {
+        if (format == "ini") {
+            if (nospace) {
+                return IniNoSpacePrinter();
+            }
+            return IniPrinter(" = ");
+        }
+        if (format == "lines") {
+            return LinesPrinter();
+        }
+        if (format == "sh") {
+            return ShPrinter();
+        }
+        return Printer();
+    }
+}
+
+# `[section]` and `name = value`, the lines of an INI file. data.ini's
+# stringify writes them, so the format is exactly the library's; a value's
+# later lines are indented by one space, as continuation lines.
+pub class IniPrinter : Printer {
+    pub let separator: string;
+
+    new(separator: string) {
+        this.separator = separator;
+    }
+
+    pub override func section_header(section: string): string {
+        let doc: dict[string, dict[string, string]] = {section: {}};
+        return stringify(doc);
+    }
+
+    pub override func name_value(name: string?, value: string?, section: string?): string {
+        let text = (value ?? "").replace("\n", "\n ");
+        if (this.separator == " = ") {
+            let doc: dict[string, dict[string, string]] = {"": {(name ?? ""): text}};
+            return stringify(doc);
+        }
+        return (name ?? "") + this.separator + text;
+    }
+}
+
+# --ini-options=nospace: `name=value`, which stringify cannot write.
+pub final class IniNoSpacePrinter : IniPrinter {
+    new() {
+        super("=");
+    }
+}
+
+# `[ section ] name = value` on one line: unambiguous, and easy to read
+# from the shell (newlines in a value are written as `\n`).
+pub final class LinesPrinter : Printer {
+    pub override func name_value(name: string?, value: string?, section: string?): string {
+        var line = "";
+        match section {
+            Some(title) => {
+                line = "[ " + title + " ]";
+                if (name.is_some()) {
+                    line = line + " ";
+                }
+            },
+            None => {},
+        }
+        line = line + (name ?? "");
+        let text = value ?? "";
+        if (text != "") {
+            line = line + " = " + text.replace("\n", "\\n");
+        }
+        return line;
+    }
+}
+
+# `name=VALUE` lines to `eval` in a shell. The value is quoted with
+# core.shlex; the name must be a shell identifier, or eval would run it
+# (think of a parameter named `rm -rf /;x`), so anything else is an error.
+pub final class ShPrinter : Printer {
+    pub override func name_value(name: string?, value: string?, section: string?): string {
+        var identifier = name ?? "";
+        match section {
+            Some(title) => {
+                if (identifier != "") {
+                    identifier = title + "_" + identifier;
+                }
+            },
+            None => {},
+        }
+        if (!is_sh_identifier(identifier)) {
+            throw ShIdentifierError(identifier);
+        }
+        return identifier + "=" + quote(value ?? "");
+    }
+}
+
+func make_sh_name_chars(): set[string] {
+    var chars: set[string] = {"_"};
+    for (c in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") {
+        chars.add(c);
+    }
+    return chars;
+}
+
+# The characters of a shell variable name.
+let SH_NAME_CHARS: set[string] = make_sh_name_chars();
+
+pub func is_sh_identifier(name: string): bool {
+    if (name == "" or "0123456789".contains(name.slice(0, 1))) {
+        return false;
+    }
+    for (c in name) {
+        if (!SH_NAME_CHARS.contains(c)) {
+            return false;
+        }
+    }
+    return true;
+}

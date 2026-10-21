@@ -1,0 +1,58 @@
+@mode(host.dual)
+
+# The text crudini prints for --help and --version.
+#
+# Runtime: host.dual, but only ever interpreted here: bin/crudini.lpscr
+# imports it under `loup run`, and tests/e2e.sh checks its output there.
+# It uses nothing a native build lacks, so it stays compilable.
+
+from .appinfo import (APP_NAME, APP_VERSION, APP_SUMMARY);
+
+pub func usage(): string {
+    let lines = [
+        i"usage: {$ APP_NAME $} --set [OPTION]...   config_file section   [param] [value]",
+        i"  or:  {$ APP_NAME $} --get [OPTION]...   config_file [section] [param]",
+        i"  or:  {$ APP_NAME $} --del [OPTION]...   config_file section   [param] [list value]",
+        i"  or:  {$ APP_NAME $} --merge [OPTION]... config_file [section]",
+        "",
+        APP_SUMMARY,
+        "",
+        "SECTION can be empty (\"\") or \"DEFAULT\", in which case the global",
+        "parameters (those before any section) are used. With --set, \"DEFAULT\"",
+        "also adds an explicit [DEFAULT] header.",
+        "",
+        "Several --set and --del operations, or several --get operations, may",
+        "work on one config_file. A config_file of - is standard input; --merge",
+        "reads the settings to merge from standard input.",
+        "",
+        "Options:",
+        "  --existing[=WHAT]  for --set, --del and --merge, fail if an item is",
+        "                     missing, where WHAT is 'file', 'section' or 'param';",
+        "                     without WHAT, every item named must exist",
+        "  --format=FMT       for --get, the output format: 'sh', 'ini' or 'lines'",
+        "  --ini-options=OPT  comma-separated options for reading and writing:",
+        "                       'nospace': write name=value, not name = value",
+        "                       'space': write name = value everywhere",
+        "                       'sectionspace': one blank line between sections",
+        "                       'ignoreindent': ignore leading whitespace",
+        "  --inplace          write the file in place (or append to it) instead",
+        "                     of replacing it with a new file",
+        "  --list             for --set and --del, update a list (set) of values",
+        "  --list-sep=STR     separate list values with STR instead of \", \";",
+        "                     an empty STR means any whitespace",
+        "  --output=FILE      write the result to FILE instead; - is stdout",
+        "  --verbose          say on stderr whether the file changed",
+        "  --help             display this help and exit",
+        "  --version          output version information and exit",
+        "",
+        "Under `loup run`, the options go after `--`:",
+        i"  loup run bin/{$ APP_NAME $}.lpscr -- --get app.ini db host",
+        "",
+        "Exit status: 0 success, 1 any error (usage errors included).",
+    ];
+    return lines.join("\n");
+}
+
+pub func version_line(): string {
+    return i"{$ APP_NAME $} (loup-cmd-{$ APP_NAME $}) {$ APP_VERSION $}";
+}

@@ -1,0 +1,95 @@
+@mode(host.scripted)
+
+# crudini's list values (--list): a parameter whose value is a list such as
+# `plugins = auth, cache`, updated one item at a time.
+#
+# Runtime: host.scripted. A module of the script bin/crudini.lpscr,
+# interpreted with it by `loup run`; the unit tests import it under Stage0's
+# test runner (`loup-bootstrap test --no-parallel --file`).
+
+from .lexer import (is_space);
+
+# How the items of a list value are separated.
+pub enum ListSep {
+    # Commas (crudini's default), written ", " unless the value already
+    # uses bare commas.
+    Commas,
+    # Any run of whitespace; the value's first run is kept as the joiner.
+    Whitespace,
+    # A literal string given with --list-sep.
+    Text(sep: string),
+}
+
+# Splits a value on runs of spaces, tabs and line breaks.
+pub func split_whitespace(value: string): list[string] {
+    var items: list[string] = [];
+    var word = "";
+    for (c in value) {
+        if (is_space(c) or c == "\n" or c == "\r") {
+            if (word != "") {
+                items.push(word);
+                word = "";
+            }
+        } else {
+            word = word + c;
+        }
+    }
+    if (word != "") {
+        items.push(word);
+    }
+    return items;
+}
+
+# The first run of whitespace in a value, or " " when there is none.
+func first_gap(value: string): string {
+    var gap = "";
+    for (c in value) {
+        if (is_space(c) or c == "\n" or c == "\r") {
+            gap = gap + c;
+        } else if (gap != "") {
+            return gap;
+        }
+    }
+    return " ";
+}
+
+# The value after adding `item` to the list in `current` (when `adding`) or
+# removing its first occurrence. An item already present is not added
+# twice: the list is a set that keeps its order.
+pub func update_list(current: string, item: string, adding: bool, sep: ListSep): string {
+    var items: list[string] = [];
+    var joiner = ", ";
+    match sep {
+        ListSep.Commas => {
+            if (current != "") {
+                for (part in current.split(",")) {
+                    items.push(part.trim());
+                }
+                if (!current.contains(" ") and current.contains(",")) {
+                    joiner = ",";
+                }
+            }
+        },
+        ListSep.Whitespace => {
+            items = split_whitespace(current);
+            joiner = first_gap(current);
+        },
+        ListSep.Text(text) => {
+            if (current != "") {
+                items = current.split(text);
+            }
+            joiner = text;
+        },
+    }
+    if (adding) {
+        if (!items.contains(item)) {
+            items.push(item);
+        }
+    } else {
+        let at = items.index_of(item);
+        if (at >= 0) {
+            items.remove(at);
+        }
+    }
+    return items.join(joiner);
+}

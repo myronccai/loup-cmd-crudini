@@ -1,0 +1,35 @@
+@mode(host.scripted)
+
+# Unit tests for crudini's list values (lib/listval.lpscr): the three kinds
+# of separator, adding and removing items, and empty lists.
+#
+# Runtime: host.scripted, run by the test runner: `make test` interprets
+# this file with Stage0 (`loup-bootstrap test --no-parallel --file`), one
+# test per `func test_*()`. It imports lib/ with relative imports. It is not
+# part of the program.
+
+from debug.assert import (expectEq);
+from ..lib.listval import (ListSep, update_list, split_whitespace);
+
+func test_commas(): void {
+    expectEq(update_list("a, b", "c", true, ListSep.Commas), "a, b, c", "spaced");
+    expectEq(update_list("a,b", "c", true, ListSep.Commas), "a,b,c", "bare commas kept");
+    expectEq(update_list("a", "b", true, ListSep.Commas), "a, b", "one item gets spaces");
+    expectEq(update_list("", "a", true, ListSep.Commas), "a", "empty list");
+    expectEq(update_list("a ,  b", "b", true, ListSep.Commas), "a, b", "items trimmed, no duplicate");
+    expectEq(update_list("a, b, a", "a", false, ListSep.Commas), "b, a", "first occurrence removed");
+    expectEq(update_list("a, b", "z", false, ListSep.Commas), "a, b", "absent item");
+}
+
+func test_whitespace(): void {
+    expectEq(split_whitespace(" a\tb  c\n").join("|"), "a|b|c", "split");
+    expectEq(update_list("a\tb", "c", true, ListSep.Whitespace), "a\tb\tc", "first gap reused");
+    expectEq(update_list("a  b c", "b", false, ListSep.Whitespace), "a  c", "removed");
+    expectEq(update_list("", "x", true, ListSep.Whitespace), "x", "empty");
+}
+
+func test_text_separator(): void {
+    expectEq(update_list("a:b", "c", true, ListSep.Text(sep = ":")), "a:b:c", "added");
+    expectEq(update_list("a : b", "b", false, ListSep.Text(sep = ":")), "a : b", "not trimmed");
+    expectEq(update_list("a;b;c", "b", false, ListSep.Text(sep = ";")), "a;c", "removed");
+}

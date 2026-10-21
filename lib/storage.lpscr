@@ -1,0 +1,97 @@
+@mode(host.scripted)
+
+# crudini's file access: reading a config file as lines, and writing the
+# result by replacing the file, rewriting it in place, or appending to it.
+#
+# Runtime: host.scripted. A module of the script bin/crudini.lpscr,
+# interpreted with it by `loup run`; the unit tests import it under Stage0's
+# test runner (`loup-bootstrap test --no-parallel --file`), which writes its
+# files under build/tmp/. Under the self-hosted `loup run` an IoError cannot
+# be caught, so callers check read_problem() before reading.
+
+from io.fs import (readLines, writeLines, appendText, exists, isDir, copy, rename, remove);
+from io.path import (dirname);
+from system.time import (realtimeNs);
+
+pub const STDIN: string = "/dev/stdin";
+
+# Why `path` cannot be read as a config file, or None when it can.
+pub func read_problem(path: string): string? {
+    if (path == "-") {
+        return None;
+    }
+    if (!exists(path)) {
+        return Some("No such file or directory");
+    }
+    if (isDir(path)) {
+        return Some("Is a directory");
+    }
+    return None;
+}
+
+# Why `path` cannot be written, or None: its directory must exist.
+pub func write_problem(path: string): string? {
+    if (isDir(path)) {
+        return Some("Is a directory");
+    }
+    let dir = dirname(path);
+    if (dir != "" and !isDir(dir)) {
+        return Some("No such file or directory");
+    }
+    return None;
+}
+
+# The lines of a config file ("-" is standard input), without their line
+# breaks. readLines drops the empty piece after a final newline, so a file
+# that lacks one reads the same as one that has it.
+pub func read_config(path: string): list[string] {
+    return readLines(if (path == "-") { STDIN } else { path });
+}
+
+# The text of the lines as a file holds them: each ends with a newline.
+pub func text_of(lines: list[string]): string {
+    if (lines.len() == 0) {
+        return "";
+    }
+    return lines.join("\n") + "\n";
+}
+
+# Replaces `path` with a new file holding `lines`, as crudini does by
+# default: the new contents go to a temporary file next to it, which then
+# takes the old file's place in one rename, so a reader sees either the old
+# file or the new one. Copying the old file first gives the temporary file
+# its permission bits. A failure on the way removes the temporary file.
+pub func replace_file(path: string, lines: list[string]): void {
+    var temp = path + ".crudini-" + str(realtimeNs() % 1000000000) + ".tmp";
+    while (exists(temp)) {
+        temp = temp + "~";
+    }
+    try {
+        if (exists(path)) {
+            copy(path, temp);
+        }
+        writeLines(temp, lines);
+        rename(temp, path);
+    } finally {
+        if (exists(temp)) {
+            remove(temp);
+        }
+    }
+}
+
+# Writes `lines` into `path` itself (--inplace): no new file, so links,
+# ownership and permissions stay, but a reader may see it half written.
+# When `before` is what the file held and the new text only adds lines at
+# its end, those lines are appended instead, which a reader can never see
+# half missing. Loup has no file locks, so the file is read again right
+# before: if it changed meanwhile, it is rewritten whole. True when it
+# appended.
+pub func rewrite_in_place(path: string, before: string, lines: list[string]): bool {
+    let after = text_of(lines);
+    if (before != "" and after.startsWith(before) and exists(path) and readText(path) == before) {
+        appendText(path, after.slice(before.len()));
+        return true;
+    }
+    writeLines(path, lines);
+    return false;
+}

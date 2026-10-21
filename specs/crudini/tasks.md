@@ -1,0 +1,26 @@
+# Tasks: crudini
+
+- [x] 1. Layout: `bin/crudini.lpscr` entry script, `lib/` modules, relative imports, manifest entry and test pattern for scripts
+  - _Requirements: all_
+- [x] 2. Command line: operation grouping, option table and `Settings` namespace, typed getter macros, prefixes, validation and messages
+  - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6_
+- [x] 3. Line scanner with tokens that borrow their line
+  - _Requirements: 2.1, 2.2, 2.7_
+- [x] 4. Document model: blocks of `Entry | string`, DEFAULT, duplicates, inheritance, BOM and CRLF, unchanged round trip
+  - _Requirements: 2.3, 2.4, 2.5, 2.6_
+- [x] 5. `--get` in the plain, ini, lines and sh formats; standard input
+  - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6_
+- [x] 6. `--set`: values, new parameters and sections, bare names, DEFAULT header, styles, multi-line values
+  - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7_
+- [x] 7. `--del` of parameters, sections and DEFAULT, with tidying
+  - _Requirements: 5.1, 5.2, 5.3_
+- [x] 8. `--list` and `--list-sep`
+  - _Requirements: 6.1, 6.2, 6.3_
+- [x] 9. `--merge` from standard input with `data.ini`
+  - _Requirements: 7.1, 7.2_
+- [x] 10. `--existing`
+  - _Requirements: 8.1, 8.2, 8.3_
+- [x] 11. Writing: replace through a temporary file, `--inplace` with append, `--output`, `sectionspace`, `--verbose`
+  - _Requirements: 9.1, 9.2, 9.3, 9.4, 9.5, 9.6_
+- [x] 12. Unit tests, fixture, end-to-end tests with `loup run`
+  - _Requirements: all_

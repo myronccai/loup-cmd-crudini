@@ -1,0 +1,168 @@
+#!/usr/bin/env -S loup run
+@mode(host.scripted)
+
+# crudini: query and edit INI files from the command line.
+#
+# Runtime: host.scripted. The program's entry point: the Loup scripted
+# runtime interprets this file from source (`loup run bin/crudini.lpscr --
+# ARGS`, as `make run`, tests/e2e.sh and CI do; on Linux x86-64 that is the
+# self-hosted driver). Its top-level statements run in order and there is no
+# compile step: a script entry cannot be compiled, so the project has no
+# binary. `make check` type-checks it, with every lib/ module it imports,
+# using Stage0 (`loup-bootstrap check`). crudini's options are all long
+# options, and under `loup run` they must follow `--`.
+#
+# Structure: this script is the only code that reads files, prints and sets
+# the exit status. It parses the command line (errors exit 1, most with a
+# hint), handles --help and --version, reads the config file (and for
+# --merge standard input), runs every operation through one Editor, then
+# prints what --get produced or writes the changed document the way the
+# options ask, and finally reports the change with --verbose.
+
+from data.ini import (parse);
+from core.shlex import (quote);
+from ..lib.appinfo import (APP_NAME, EXIT_OK, EXIT_FAILURE);
+from ..lib.usage import (usage, version_line);
+from ..lib.options import (Mode, parse_command_line, mode_word, setting_flag, setting_text, existing_mode, ini_options);
+from ..lib.document import (IniDocument, DEFAULT_SECTION);
+from ..lib.editor import (Editor);
+from ..lib.errors import (CrudiniError);
+from ..lib.storage import (STDIN, read_problem, write_problem, read_config, text_of, replace_file, rewrite_in_place);
+
+func fail(message: string): noreturn {
+    printErr(APP_NAME + ": " + message);
+    exit(EXIT_FAILURE);
+    unreachable;
+}
+
+let parsed = parse_command_line(args());
+if (parsed.is_err()) {
+    let problem = parsed.unwrap_err();
+    printErr(APP_NAME + ": " + problem.message);
+    if (problem.usage) {
+        printErr("Try '" + APP_NAME + " --help' for more information.");
+    }
+    exit(EXIT_FAILURE);
+}
+let request = parsed.unwrap();
+let settings = request.settings;
+if (setting_flag!(settings, "help")) {
+    println(usage());
+    exit(EXIT_OK);
+}
+if (setting_flag!(settings, "version")) {
+    println(version_line());
+    exit(EXIT_OK);
+}
+
+let operations = request.operations;
+let file: string = operations[0].file;
+let options = ini_options(settings);
+# The run's mode: the first operation's, except that any --set makes it a
+# --set run (a missing file is then created), as in crudini.
+var mode = operations[0].mode;
+for (op in operations) {
+    if (op.mode == Mode.Set) {
+        mode = Mode.Set;
+    }
+}
+
+# A missing file reads as an empty document: --set and --merge create it,
+# --del leaves it missing. --get, and --existing in any form, need it.
+var lines: list[string] = [];
+match read_problem(file) {
+    Some(problem) => {
+        if (mode == Mode.Get or existing_mode(settings) != "" or problem != "No such file or directory") {
+            fail(file + ": " + problem);
+        }
+    },
+    None => {
+        lines = read_config(file);
+    },
+}
+var doc = IniDocument();
+try {
+    doc = IniDocument.read(lines, file, options.contains("ignoreindent"));
+} catch (CrudiniError as e) {
+    fail(e.message);
+}
+let restyle = if (options.contains("nospace")) { "nospace" } else if (options.contains("space")) { "space" } else { "" };
+safe {
+    doc.use_style(options.contains("nospace"), restyle);
+}
+# Naming the global section DEFAULT (rather than "") in a --set or --merge
+# gives it an explicit header, at the top of the file.
+if (request.explicit_default and (mode == Mode.Set or mode == Mode.Merge) and !doc.has_section(DEFAULT_SECTION)) {
+    safe {
+        doc.add_default_header();
+    }
+}
+
+# --merge takes the settings to merge from standard input, read with
+# data.ini: only their values matter, not their layout.
+var input: dict[string, dict[string, string]] = {};
+if (mode == Mode.Merge) {
+    input = parse(readText(STDIN));
+}
+
+let editor = Editor(settings, doc, options.contains("nospace"));
+var failure = "";
+try {
+    for (op in operations) {
+        safe {
+            editor.apply(op, input);
+        }
+    }
+} catch (CrudiniError as e) {
+    failure = e.message;
+}
+
+# --get prints what it found, even when a later operation fails.
+if (mode == Mode.Get) {
+    for (line in editor.output) {
+        println(line);
+    }
+    if (failure != "") {
+        fail(failure);
+    }
+    exit(EXIT_OK);
+}
+if (failure != "") {
+    fail(failure);
+}
+
+let before = text_of(lines);
+let written = doc.encode(doc.render(options.contains("sectionspace"), editor.removed_section));
+let after = text_of(written);
+let changed = after != before;
+let output: string = setting_text!(settings, "output");
+let target: string = if (output == "") { file } else { output };
+if (target == "-") {
+    print(after);
+} else if (changed or target != file) {
+    match write_problem(target) {
+        Some(problem) => {
+            fail(target + ": " + problem);
+        },
+        None => {},
+    }
+    if (setting_flag!(settings, "inplace")) {
+        rewrite_in_place(target, before, written);
+    } else {
+        replace_file(target, written);
+    }
+}
+
+# --verbose names the last operation, its words quoted for the shell.
+if (setting_flag!(settings, "verbose")) {
+    let last = operations[-1];
+    var words: list[string] = [];
+    for (part in [mode_word(last.mode), last.file, last.section ?? "", last.param ?? "", last.value ?? ""]) {
+        if (part != "") {
+            words.push(quote(part).replace("\n", "\\n"));
+        }
+    }
+    let state = if (changed) { "changed" } else { "unchanged" };
+    printErr(state + ": " + words.join(" "));
+}
+exit(EXIT_OK);

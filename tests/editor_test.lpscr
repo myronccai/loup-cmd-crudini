@@ -1,0 +1,149 @@
+@mode(host.scripted)
+
+# Unit tests for crudini's operations (lib/editor.lpscr): --get in every
+# format, --set, --del, lists, --merge and --existing, each run on a small
+# document through the same command-line parser the script uses.
+#
+# Runtime: host.scripted, run by the test runner: `make test` interprets
+# this file with Stage0 (`loup-bootstrap test --no-parallel --file`), one
+# test per `func test_*()`. It imports lib/ with relative imports. It is not
+# part of the program.
+
+from debug.assert import (expect, expectEq);
+from data.ini import (parse);
+from ..lib.options import (Request, parse_command_line, ini_options);
+from ..lib.document import (IniDocument);
+from ..lib.editor import (Editor);
+from ..lib.errors import (CrudiniError, NoSectionError, NoOptionError, ShIdentifierError);
+
+let BASE: list[string] = [
+    "log = info",
+    "",
+    "[db]",
+    "host = localhost",
+    "port = 5432",
+    "",
+    "[web]",
+    "plugins = auth,cache",
+    "",
+    "[empty]",
+];
+
+# Runs a command line (its file operand is ignored) on `lines`; the editor
+# keeps the --get output and the changed document.
+func run(lines: list[string], argv: list[string], stdin: string): Editor {
+    let request: Request = parse_command_line(argv).unwrap();
+    let doc = IniDocument.read(lines, "t.ini", false);
+    safe {
+        doc.use_style(ini_options(request.settings).contains("nospace"), "");
+    }
+    let editor = Editor(request.settings, doc, ini_options(request.settings).contains("nospace"));
+    for (op in request.operations) {
+        safe {
+            editor.apply(op, parse(stdin));
+        }
+    }
+    return editor;
+}
+
+func got(argv: list[string]): string {
+    return run(BASE, argv, "").output.join("|");
+}
+
+func edited(argv: list[string]): string {
+    let editor = run(BASE, argv, "");
+    return editor.doc.render(false, editor.removed_section).join("|");
+}
+
+# The message of the CrudiniError an operation throws, or "".
+func failure(lines: list[string], argv: list[string]): string {
+    try {
+        run(lines, argv, "");
+    } catch (CrudiniError as e) {
+        return e.message;
+    }
+    return "";
+}
+
+func test_get_plain(): void {
+    expectEq(got(["--get", "f"]), "DEFAULT|db|web|empty", "sections");
+    expectEq(got(["--get", "f", "db"]), "host|port", "names");
+    expectEq(got(["--get", "f", "db", "PORT"]), "5432", "value");
+    expectEq(got(["--get", "f", "web", "log"]), "info", "inherited");
+    expectEq(got(["--get", "f", "", "log"]), "info", "global");
+    expectEq(got(["--get", "f", "empty"]), "", "nothing in it");
+}
+
+func test_get_formats(): void {
+    expectEq(got(["--format=ini", "--get", "f", "db"]), "[db]|host = localhost|port = 5432", "ini");
+    expectEq(got(["--format=ini", "--ini-options=nospace", "--get", "f", "db", "port"]), "port=5432", "ini nospace");
+    expectEq(got(["--format=lines", "--get", "f"]), "[ DEFAULT ] log = info|[ db ] host = localhost|[ db ] port = 5432|[ web ] plugins = auth,cache|[ empty ]", "lines");
+    expectEq(got(["--format=sh", "--get", "f"]), "log=info|db_host=localhost|db_port=5432|web_plugins=auth,cache", "sh, whole file");
+    expectEq(got(["--format", "sh", "--get", "f", "db"]), "host=localhost|port=5432", "sh, one section");
+}
+
+func test_get_errors(): void {
+    expectEq(failure(BASE, ["--get", "f", "nope"]), "Section not found: nope", "section");
+    expectEq(failure(BASE, ["--get", "f", "db", "user"]), "Parameter not found: user", "parameter");
+    let bad = ["[a]", "x-y = 1"];
+    expectEq(failure(bad, ["--format=sh", "--get", "f", "a"]), "Invalid sh identifier \"x-y\"", "sh name");
+}
+
+func test_get_output_before_an_error(): void {
+    let editor = run(["[a]", "ok = 1", "bad-name = 2"], ["--get", "f", "a", "ok"], "");
+    expectEq(editor.output.join("|"), "1", "first get");
+    var thrown = false;
+    try {
+        run(["[a]", "ok = 1", "bad-name = 2"], ["--format=sh", "--get", "f", "a"], "");
+    } catch (ShIdentifierError as e) {
+        thrown = e.identifier == "bad-name";
+    }
+    expect(thrown, "sh stops at the bad name");
+}
+
+func test_set(): void {
+    expectEq(edited(["--set", "f", "db", "port", "6432"]), "log = info||[db]|host = localhost|port = 6432||[web]|plugins = auth,cache||[empty]", "change");
+    expectEq(edited(["--set", "f", "db", "user", "admin"]), "log = info||[db]|host = localhost|port = 5432|user = admin||[web]|plugins = auth,cache||[empty]", "add after the last");
+    expectEq(edited(["--set", "f", "new", "k", "v"]), "log = info||[db]|host = localhost|port = 5432||[web]|plugins = auth,cache||[empty]||[new]|k = v", "new section at the end");
+    expectEq(edited(["--set", "f", "", "level", "2"]), "log = info|level = 2||[db]|host = localhost|port = 5432||[web]|plugins = auth,cache||[empty]", "global");
+    expectEq(edited(["--set", "f", "empty", "k"]), "log = info||[db]|host = localhost|port = 5432||[web]|plugins = auth,cache||[empty]|k = ", "no value");
+}
+
+func test_set_flags(): void {
+    let lines = ["[mysqld]", "skip-name-resolve", "port = 3306"];
+    let editor = run(lines, ["--set", "f", "mysqld", "skip-networking", "--set", "f", "mysqld", "skip-name-resolve"], "");
+    expectEq(editor.doc.render(false, false).join("|"), "[mysqld]|skip-name-resolve|port = 3306|skip-networking", "bare names stay bare");
+}
+
+func test_del(): void {
+    expectEq(edited(["--del", "f", "db", "port"]), "log = info||[db]|host = localhost||[web]|plugins = auth,cache||[empty]", "parameter");
+    expectEq(edited(["--del", "f", "db"]), "log = info||[web]|plugins = auth,cache||[empty]", "section, tidied");
+    expectEq(edited(["--del", "f", "DEFAULT"]), "|[db]|host = localhost|port = 5432||[web]|plugins = auth,cache||[empty]", "global parameters");
+    expectEq(edited(["--del", "f", "nope", "x"]), BASE.join("|"), "missing: no change");
+}
+
+func test_lists(): void {
+    expectEq(run(BASE, ["--list", "--set", "f", "web", "plugins", "gzip"], "").doc.lookup("web", "plugins").unwrap().full_value, "auth,cache,gzip", "bare commas kept");
+    expectEq(run(BASE, ["--list", "--set", "f", "web", "plugins", "auth"], "").doc.lookup("web", "plugins").unwrap().full_value, "auth,cache", "no duplicate");
+    expectEq(run(BASE, ["--list", "--del", "f", "web", "plugins", "auth"], "").doc.lookup("web", "plugins").unwrap().full_value, "cache", "removed");
+    expectEq(run(BASE, ["--list", "--set", "f", "db", "log", "debug"], "").doc.lookup_own("db", "log").unwrap().full_value, "info, debug", "extends the inherited list");
+    expectEq(run(BASE, ["--list", "--set", "f", "web", "plugins"], "").doc.lookup("web", "plugins").unwrap().full_value, "", "emptied");
+}
+
+func test_merge(): void {
+    let editor = run(BASE, ["--merge", "f"], "log = info\nnew = 1\n[db]\nport = 6543\nlog = info\n[extra]\n");
+    expectEq(editor.doc.render(false, false).join("|"), "log = info|new = 1||[db]|host = localhost|port = 6543||[web]|plugins = auth,cache||[empty]||[extra]", "merged, defaults skipped");
+    let into = run(BASE, ["--merge", "f", "web"], "a = 1\n[x]\nb = 2\n");
+    expectEq(into.doc.target("web").fieldNames().join(","), "plugins,a,b", "all into one section");
+}
+
+func test_existing(): void {
+    expectEq(failure(BASE, ["--existing", "--set", "f", "nope", "k", "v"]), "Section not found: nope", "section");
+    expectEq(failure(BASE, ["--existing", "--set", "f", "db", "user", "v"]), "Parameter not found: user", "param");
+    expectEq(failure(BASE, ["--existing=section", "--set", "f", "db", "user", "v"]), "", "section mode adds parameters");
+    expectEq(failure(BASE, ["--existing=section", "--del", "f", "nope"]), "Section not found: nope", "del section");
+    expectEq(failure(BASE, ["--existing", "--del", "f", "db", "user"]), "Parameter not found: user", "del param");
+    expectEq(failure(BASE, ["--existing=file", "--set", "f", "nope", "k", "v"]), "", "file mode adds sections");
+    let editor = run(BASE, ["--existing", "--merge", "f"], "[db]\nport = 1\nuser = x\n");
+    expectEq(editor.doc.target("db").fieldNames().join(","), "host,port", "merge skips missing parameters");
+}

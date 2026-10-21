@@ -1,0 +1,178 @@
+@mode(host.scripted)
+
+# crudini's line scanner: decides what one line of an INI file is and where
+# its parts are, without copying the line.
+#
+# Runtime: host.scripted. A module of the script bin/crudini.lpscr,
+# interpreted with it by `loup run`; the unit tests import it under Stage0's
+# test runner (`loup-bootstrap test --no-parallel --file`).
+#
+# Structure: scan_line() returns a LineToken, a small struct that borrows
+# the line it describes (lifetime ~src) and records offsets into it. The
+# document reader (lib/document.lpscr) copies out only the pieces it keeps,
+# so a token never outlives its line and holds no copies of it. The rules
+# are iniparse's, the parser crudini uses: the first `=` or `:` separates a
+# name from its value, `;` after whitespace starts an inline comment, and an
+# indented line continues the value above it.
+
+pub enum LineKind {
+    Blank,
+    Comment,
+    Header,
+    Param,
+    Flag,
+    Continuation,
+    Invalid,
+}
+
+# First characters of a comment line, as crudini sets them (`%` starts the
+# include lines of Mercurial's config files).
+pub let COMMENT_CHARS: set[string] = {"#", ";", "%"};
+
+pub func is_space(c: string): bool {
+    return c == " " or c == "\t";
+}
+
+# A line and the offsets of its parts (half-open ranges into `text`):
+# - Header: name_start..name_end is the section name.
+# - Param: text[0..name_start] is the indent, name_start..name_end the name,
+#   name_end..value_start the separator with its spaces, value_start..value_end
+#   the value, and comment_start the `;` of an inline comment (-1: none).
+# - Flag (a name with no value): name_start..name_end is the name.
+# - Continuation: value_start..value_end is the text without its indent.
+pub struct LineToken[lifetime ~src] {
+    borrow[~src] text: string;
+    pub kind: LineKind;
+    pub name_start: int;
+    pub name_end: int;
+    pub value_start: int;
+    pub value_end: int;
+    pub comment_start: int;
+
+    # The whole line.
+    pub func line(): string {
+        return this.text;
+    }
+
+    pub func name(): string {
+        return this.text.slice(this.name_start, this.name_end);
+    }
+
+    pub func indent(): string {
+        return this.text.slice(0, this.name_start);
+    }
+
+    pub func separator(): string {
+        return this.text.slice(this.name_end, this.value_start);
+    }
+
+    pub func value(): string {
+        return this.text.slice(this.value_start, this.value_end);
+    }
+
+    pub func comment(): string {
+        if (this.comment_start < 0) {
+            return "";
+        }
+        return this.text.slice(this.comment_start);
+    }
+}
+
+func token[lifetime ~a](borrow[~a] line: string, kind: LineKind, name_start: int, name_end: int,
+                        value_start: int, value_end: int, comment_start: int): LineToken[~a] {
+    return LineToken(text = line, kind = kind, name_start = name_start, name_end = name_end,
+                     value_start = value_start, value_end = value_end, comment_start = comment_start);
+}
+
+# The end of line[0..stop] without trailing spaces and tabs.
+func trim_end(line: string, stop: int): int {
+    var end = stop;
+    while (end > 0 and is_space(line.slice(end - 1, end))) {
+        end -= 1;
+    }
+    return end;
+}
+
+# Classifies one line (without its line break). `continues` says whether an
+# indented line here would continue the value of a parameter above it.
+# With `ignore_indent` (--ini-options=ignoreindent) leading whitespace never
+# matters: there are no continuation lines, and indented headers and
+# parameters count as such.
+pub func scan_line[lifetime ~a](borrow[~a] line: string, continues: bool, ignore_indent: bool): LineToken[~a] {
+    let n = line.len();
+    var lead = 0;
+    while (lead < n and is_space(line.slice(lead, lead + 1))) {
+        lead += 1;
+    }
+    if (lead == n) {
+        return token(line, LineKind.Blank, 0, 0, 0, 0, -1);
+    }
+    if (lead > 0 and !ignore_indent) {
+        if (continues) {
+            return token(line, LineKind.Continuation, lead, lead, lead, trim_end(line, n), -1);
+        }
+        return token(line, LineKind.Invalid, 0, 0, 0, 0, -1);
+    }
+    let first = line.slice(lead, lead + 1);
+    if (COMMENT_CHARS.contains(first)) {
+        return token(line, LineKind.Comment, 0, 0, 0, 0, -1);
+    }
+    if (first == "[") {
+        return scan_header(line, lead);
+    }
+    return scan_param(line, lead);
+}
+
+# `[name]`, optionally followed by spaces and a `;` or `#` comment. The name
+# runs to the first `]` and may not be empty.
+func scan_header[lifetime ~a](borrow[~a] line: string, lead: int): LineToken[~a] {
+    let after = line.slice(lead + 1);
+    let close = after.index_of("]");
+    if (close <= 0) {
+        return token(line, LineKind.Invalid, 0, 0, 0, 0, -1);
+    }
+    let rest = after.slice(close + 1).trim();
+    if (rest != "" and !rest.startsWith(";") and !rest.startsWith("#")) {
+        return token(line, LineKind.Invalid, 0, 0, 0, 0, -1);
+    }
+    return token(line, LineKind.Header, lead + 1, lead + 1 + close, 0, 0, -1);
+}
+
+# `name = value`, `name: value` or a bare `name`.
+func scan_param[lifetime ~a](borrow[~a] line: string, lead: int): LineToken[~a] {
+    let n = line.len();
+    var delim = lead;
+    while (delim < n) {
+        let c = line.slice(delim, delim + 1);
+        if (c == "=" or c == ":") {
+            break;
+        }
+        delim += 1;
+    }
+    if (delim == n) {
+        let end = trim_end(line, n);
+        return token(line, LineKind.Flag, lead, end, end, end, -1);
+    }
+    if (delim == lead) {
+        # `= value` has no name.
+        return token(line, LineKind.Invalid, 0, 0, 0, 0, -1);
+    }
+    let name_end = trim_end(line, delim);
+    var value_start = delim + 1;
+    while (value_start < n and is_space(line.slice(value_start, value_start + 1))) {
+        value_start += 1;
+    }
+    var value_end = trim_end(line, n);
+    if (value_end < value_start) {
+        value_end = value_start;
+    }
+    # Only the first `;` of the value can start a comment, and only after
+    # whitespace (`url = a;b` keeps its `;`), as in ConfigParser.
+    var comment_start = -1;
+    let semi = line.slice(value_start, value_end).index_of(";");
+    if (semi > 0 and is_space(line.slice(value_start + semi - 1, value_start + semi))) {
+        comment_start = value_start + semi;
+        value_end = trim_end(line, comment_start);
+    }
+    return token(line, LineKind.Param, lead, name_end, value_start, value_end, comment_start);
+}

@@ -1,0 +1,446 @@
+@mode(host.scripted)
+
+# crudini's command line: the option table, the Settings namespace it
+# fills, typed getters for that namespace, and the grouping of words into
+# operations.
+#
+# Runtime: host.scripted. A module of the script bin/crudini.lpscr,
+# interpreted with it by `loup run`; the unit tests import it under Stage0's
+# test runner (`loup-bootstrap test --no-parallel --file`).
+#
+# Structure: parse_command_line() works in three passes, in crudini's
+# order. The first walks the words: --get/--set/--del/--merge start an
+# operation and the plain words after one are its operands, while every
+# other `--name` word is an option (with the next word as its value when the
+# table says it needs one). The second applies the options in order to a
+# Settings namespace and validates their values; --help and --version end it
+# at once. The third checks each operation and the operations against each
+# other.
+
+from .listval import (ListSep);
+from .document import (DEFAULT_SECTION);
+
+pub enum Mode {
+    Get,
+    Set,
+    Del,
+    Merge,
+}
+
+pub func mode_word(mode: Mode): string {
+    return match mode {
+        Mode.Get => "--get",
+        Mode.Set => "--set",
+        Mode.Del => "--del",
+        Mode.Merge => "--merge",
+    };
+}
+
+# One operation: `--set FILE SECTION PARAM VALUE` and the like. A section
+# given as "" is already turned into DEFAULT.
+pub struct Operation {
+    pub mode: Mode;
+    pub file: string;
+    pub section: string?;
+    pub param: string?;
+    pub value: string?;
+}
+
+# The options, like an argparse namespace: the parser stores each option
+# under its name with `-` turned into `_` (`--list-sep` is `list_sep`), so
+# the option table below, not this class, lists the fields. Read them with
+# the typed getters (setting_flag!, setting_text!) or a dynamic view.
+pub dynamic class Settings {
+    pub let program: string;
+
+    new(program: string) {
+        this.program = program;
+    }
+}
+
+# Typed getters for Settings: getField returns Any, and the option table
+# says which type each field holds.
+pub macro setting_flag(settings, name) {
+    quote { (${settings}.getField(${name}) as bool) }
+}
+
+pub macro setting_text(settings, name) {
+    quote { (${settings}.getField(${name}) as string) }
+}
+
+# What an option takes after it.
+enum Argument {
+    Nothing,
+    Value,
+    # Only attached: `--existing` or `--existing=WHAT`.
+    Attached,
+}
+
+# An option and the value its field starts with: false for a flag or for an
+# option that was not given, "" for text that has a default. (A class: a
+# struct field cannot hold a union.)
+class OptionSpec {
+    pub let long: string;
+    pub let argument: Argument;
+    pub let initial: bool | string;
+}
+
+let OPTIONS: list[OptionSpec] = [
+    OptionSpec(long = "existing", argument = Argument.Attached, initial = false),
+    OptionSpec(long = "format", argument = Argument.Value, initial = ""),
+    OptionSpec(long = "help", argument = Argument.Nothing, initial = false),
+    OptionSpec(long = "ini-options", argument = Argument.Value, initial = ""),
+    OptionSpec(long = "inplace", argument = Argument.Nothing, initial = false),
+    OptionSpec(long = "list", argument = Argument.Nothing, initial = false),
+    OptionSpec(long = "list-sep", argument = Argument.Value, initial = false),
+    OptionSpec(long = "output", argument = Argument.Value, initial = ""),
+    OptionSpec(long = "verbose", argument = Argument.Nothing, initial = false),
+    OptionSpec(long = "version", argument = Argument.Nothing, initial = false),
+];
+
+pub let FORMATS: set[string] = {"sh", "ini", "lines"};
+pub let INI_OPTIONS: set[string] = {"", "nospace", "space", "sectionspace", "ignoreindent"};
+pub let EXISTING_ITEMS: set[string] = {"file", "section", "param"};
+
+# A rejected command line. `usage` asks for the "Try --help" hint, which
+# crudini gives (with its whole usage) for the errors it calls usage errors.
+pub class ArgError {
+    pub let message: string;
+    pub let usage: bool;
+
+    new(message: string, usage: bool) {
+        this.message = message;
+        this.usage = usage;
+    }
+}
+
+# An accepted command line.
+pub class Request {
+    pub let settings: Settings;
+    pub var operations: list[Operation] = [];
+    # Whether the global section was named DEFAULT (not ""): then --set
+    # gives it an explicit [DEFAULT] header.
+    pub var explicit_default: bool = false;
+
+    new(settings: Settings) {
+        this.settings = settings;
+    }
+}
+
+func field_name(long: string): string {
+    return long.replace("-", "_");
+}
+
+# The option a `--name` word means: an exact name or a unique prefix of
+# one, as Python's getopt (which crudini uses) allows.
+func find_option(name: string): Result[OptionSpec, ArgError] {
+    var matches: list[OptionSpec] = [];
+    for (spec in OPTIONS) {
+        if (spec.long == name) {
+            return Ok(spec);
+        }
+        if (name != "" and spec.long.startsWith(name)) {
+            matches.push(spec);
+        }
+    }
+    if (matches.len() == 1) {
+        return Ok(matches[0]);
+    }
+    if (matches.len() > 1) {
+        return Err(ArgError("option --" + name + " not a unique prefix", true));
+    }
+    return Err(ArgError("option --" + name + " not recognized", true));
+}
+
+func operation_mode(word: string): Mode? {
+    return match word {
+        "--get" => Some(Mode.Get),
+        "--set" => Some(Mode.Set),
+        "--del" => Some(Mode.Del),
+        "--merge" => Some(Mode.Merge),
+        _ => None,
+    };
+}
+
+pub func parse_command_line(argv: list[string]): Result[Request, ArgError] {
+    # Pass 1: operations with their operands, options with their values.
+    # `current` collects the words of the operation being read.
+    var groups: list[list[string]] = [];
+    var current: list[string] = [];
+    var given: list[OptionSpec] = [];
+    var values: list[bool | string] = [];
+    var i = 0;
+    while (i < argv.len()) {
+        let word = argv[i];
+        i += 1;
+        if (operation_mode(word).is_some()) {
+            if (current.len() > 0) {
+                groups.push(current);
+            }
+            current = [word];
+            continue;
+        }
+        if (word == "--") {
+            # The rest are operands of the last operation (crudini drops
+            # them when there is none yet).
+            if (current.len() > 0) {
+                current = current + argv.slice(i);
+            }
+            break;
+        }
+        if (word.startsWith("--")) {
+            let eq = word.index_of("=");
+            let name = if (eq >= 0) { word.slice(2, eq) } else { word.slice(2) };
+            let spec = find_option(name)?;
+            var value: bool | string = true;
+            match spec.argument {
+                Argument.Nothing => {
+                    if (eq >= 0) {
+                        return Err(ArgError("option --" + spec.long + " must not have an argument", true));
+                    }
+                },
+                Argument.Value => {
+                    if (eq >= 0) {
+                        value = word.slice(eq + 1);
+                    } else if (i < argv.len()) {
+                        value = argv[i];
+                        i += 1;
+                    } else {
+                        return Err(ArgError("option --" + spec.long + " requires argument", true));
+                    }
+                },
+                Argument.Attached => {
+                    if (eq >= 0) {
+                        value = word.slice(eq + 1);
+                    }
+                },
+            }
+            given.push(spec);
+            values.push(value);
+            continue;
+        }
+        if (current.len() == 0) {
+            return Err(ArgError("Unknown operation: " + word, true));
+        }
+        current.push(word);
+    }
+    if (current.len() > 0) {
+        groups.push(current);
+    }
+
+    # Pass 2: every option starts at its initial value, then the given ones
+    # are stored and checked in order.
+    let settings = Settings("crudini");
+    for (spec in OPTIONS) {
+        settings.setField(field_name(spec.long), box spec.initial);
+    }
+    let request = Request(settings);
+    for (k in 0..given.len()) {
+        let spec = given[k];
+        let value = values[k];
+        settings.setField(field_name(spec.long), box value);
+        if (spec.long == "help" or spec.long == "version") {
+            return Ok(request);
+        }
+        match check_option(spec.long, value) {
+            Some(problem) => {
+                return Err(problem);
+            },
+            None => {},
+        }
+        if (spec.long == "existing") {
+            settings.setField("existing", existing_item(value));
+        }
+    }
+    if (groups.len() == 0) {
+        return Err(ArgError("One of --set|--del|--get|--merge must be specified", true));
+    }
+
+    # Pass 3: the operations.
+    let format = setting_text!(settings, "format");
+    let list_mode = setting_flag!(settings, "list");
+    let nospace = ini_options(settings).contains("nospace");
+    var previous: Mode? = None;
+    var file = "";
+    # None until an operation names the global section; then whether it
+    # was named DEFAULT (true) or "" (false).
+    var explicit: bool? = None;
+    for (group in groups) {
+        let mode = operation_mode(group[0])!;
+        let word = group[0];
+        let operands = group.slice(1);
+        match previous {
+            Some(before) => {
+                let editing = (before == Mode.Set or before == Mode.Del) and (mode == Mode.Set or mode == Mode.Del);
+                if (before != mode and !editing) {
+                    return Err(ArgError("--get|--merge modes can't be mixed with --set|--del", true));
+                }
+                if (before == Mode.Merge) {
+                    return Err(ArgError("--merge mode can't be repeated", true));
+                }
+            },
+            None => {},
+        }
+        previous = Some(mode);
+        if (operands.len() == 0) {
+            return Err(ArgError("missing config_file after " + word, true));
+        }
+        if (file != "" and operands[0] != file) {
+            return Err(ArgError("Can't operate on multiple files", true));
+        }
+        file = operands[0];
+        let limit = if (mode == Mode.Merge) { 2 } else { 4 };
+        if (operands.len() > limit) {
+            return Err(ArgError("extra operand '" + operands[limit] + "' for " + word, true));
+        }
+        var section: string? = if (operands.len() > 1) { Some(operands[1]) } else { None };
+        let param: string? = if (operands.len() > 2) { Some(operands[2]) } else { None };
+        let value: string? = if (operands.len() > 3) { Some(operands[3]) } else { None };
+        if (section.is_none() and (mode == Mode.Set or mode == Mode.Del)) {
+            return Err(ArgError("missing section after " + word + " " + file, true));
+        }
+        if (value.is_some() and mode != Mode.Set and !(mode == Mode.Del and list_mode)) {
+            return Err(ArgError("A value should not be specified with " + word, true));
+        }
+        if (mode == Mode.Merge and file == "-") {
+            return Err(ArgError("--merge reads its input from standard input, so config_file cannot be -", true));
+        }
+        if (mode == Mode.Merge and format == "sh") {
+            return Err(ArgError("sh format input is not supported at present", false));
+        }
+
+        # "" and DEFAULT both mean the global section, but one command may
+        # use only one of the two spellings.
+        match section {
+            Some(name) => {
+                match explicit {
+                    None => {
+                        if (name == "") {
+                            explicit = Some(false);
+                        } else if (name == DEFAULT_SECTION) {
+                            explicit = Some(true);
+                        }
+                    },
+                    Some(named) => {
+                        if ((name == "" and named) or (name == DEFAULT_SECTION and !named)) {
+                            return Err(ArgError("Conflicting DEFAULT section specifications", false));
+                        }
+                    },
+                }
+                if (name == "") {
+                    section = Some(DEFAULT_SECTION);
+                }
+                # Names that would make the file unreadable afterwards.
+                if (name.contains("[") or name.contains("]")) {
+                    return Err(ArgError("section names should not contain '[' or ']': " + name, false));
+                }
+            },
+            None => {},
+        }
+        match param {
+            Some(name) => {
+                if (name.startsWith("[")) {
+                    return Err(ArgError("param names should not start with '[': " + name, false));
+                }
+                if (name.contains("=")) {
+                    return Err(ArgError("param names should not contain '=': " + name, false));
+                }
+            },
+            None => {},
+        }
+        safe {
+            request.operations.push(make_operation(mode, file, section, param, value));
+        }
+    }
+    safe {
+        request.explicit_default = explicit ?? false;
+    }
+    return Ok(request);
+}
+
+func make_operation(mode: Mode, file: string, section: string?, param: string?, value: string?): Operation {
+    return Operation(mode = mode, file = file, section = section, param = param, value = value);
+}
+
+# The problem with an option's value, if any (crudini checks them as it
+# reads them, so the first bad one is reported).
+func check_option(long: string, value: bool | string): ArgError? {
+    match value {
+        string(text) => {
+            if (long == "format" and !FORMATS.contains(text)) {
+                return Some(ArgError("--format not recognized: " + text, true));
+            }
+            if (long == "ini-options") {
+                let names = text.split(",");
+                for (name in names) {
+                    if (!INI_OPTIONS.contains(name)) {
+                        return Some(ArgError("--ini-options not recognized: " + name, true));
+                    }
+                }
+                if (names.contains("space") and names.contains("nospace")) {
+                    return Some(ArgError("--ini-options=space,nospace are mutually exclusive", false));
+                }
+            }
+            if (long == "existing" and text != "" and !EXISTING_ITEMS.contains(text)) {
+                return Some(ArgError("--existing item not recognized: " + text, true));
+            }
+            return None;
+        },
+        bool(on) => {
+            return None;
+        },
+    }
+}
+
+# --existing alone, or with an empty value, means every item must exist:
+# crudini calls that 'param'.
+func existing_item(value: bool | string): string {
+    match value {
+        bool(on) => {
+            return "param";
+        },
+        string(text) => {
+            return if (text == "") { "param" } else { text };
+        },
+    }
+}
+
+# --existing as a word: "" when it was not given, else file, section or
+# param.
+pub func existing_mode(settings: Settings): string {
+    match settings.getField("existing") {
+        string(text) => {
+            return text;
+        },
+        _ => {
+            return "";
+        },
+    }
+}
+
+# --list-sep: not given means commas; given, an empty text means any
+# whitespace and other text itself.
+pub func list_separator(settings: Settings): ListSep {
+    match settings.getField("list_sep") {
+        string(text) => {
+            if (text == "") {
+                return ListSep.Whitespace;
+            }
+            return ListSep.Text(sep = text);
+        },
+        _ => {
+            return ListSep.Commas;
+        },
+    }
+}
+
+# --ini-options as a set of names.
+pub func ini_options(settings: Settings): set[string] {
+    var names: set[string] = set[string]();
+    for (name in setting_text!(settings, "ini_options").split(",")) {
+        if (name != "") {
+            names.add(name);
+        }
+    }
+    return names;
+}

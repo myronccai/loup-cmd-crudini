@@ -1,0 +1,406 @@
+@mode(host.scripted)
+
+# crudini's INI document: the whole file as sections of parameters and
+# verbatim lines, read from and rendered back to lines so that everything
+# an edit does not touch comes out byte for byte as it went in.
+#
+# Runtime: host.scripted. A module of the script bin/crudini.lpscr,
+# interpreted with it by `loup run`; the unit tests import it under Stage0's
+# test runner (`loup-bootstrap test --no-parallel --file`).
+#
+# Structure: IniDocument.read() scans each line (lib/lexer.lpscr) and
+# builds blocks: every header starts a Section, and the first block holds
+# what comes before any header. Comment and blank lines wait in `pending`
+# until the next line shows where they belong: inside a multi-line value
+# when a continuation line follows, in the section body otherwise. Then come
+# the queries the editor needs (sections, lookups with DEFAULT inheritance),
+# the structural edits (add and remove sections), and render(), which can
+# tidy blank lines after a removal or space sections evenly.
+
+from .lexer import (LineKind, scan_line);
+from .entry import (Entry, entry_from_token);
+from .section import (Section);
+from .errors import (ParseError);
+
+# The section that holds the global parameters: those before the first
+# header and those under [DEFAULT]. Every other section inherits from it.
+pub const DEFAULT_SECTION: string = "DEFAULT";
+
+const BOM: string = "\u{feff}";
+
+pub class IniDocument {
+    # The file as blocks in order. A section written twice has two blocks
+    # with the same name, which act as one section.
+    pub var blocks: list[Section] = [];
+    pub var bom: bool = false;
+    pub var crlf: bool = false;
+    # How new parameters are written: " = ", or "=" with nospace.
+    pub var separator: string = " = ";
+
+    new() {
+        this.blocks.push(Section(DEFAULT_SECTION, ""));
+    }
+
+    # Reads the lines of a file (without their line breaks). Throws
+    # ParseError for a line that is none of the kinds lib/lexer.lpscr knows.
+    pub static func read(lines: list[string], path: string, ignore_indent: bool): IniDocument {
+        let doc = IniDocument();
+        var current = doc.blocks[0];
+        var open: Entry? = None;
+        var pending: list[string] = [];
+        var number = 0;
+        # The loop variable is assignable: a byte order mark and a CR are
+        # stripped from it before it is scanned.
+        for (var line in lines) {
+            number += 1;
+            if (number == 1 and line.startsWith(BOM)) {
+                line = line.slice(1);
+                safe {
+                    doc.bom = true;
+                }
+            }
+            if (line.endsWith("\r")) {
+                # The first line decides how the file is written back.
+                if (number == 1) {
+                    safe {
+                        doc.crlf = true;
+                    }
+                }
+                line = line.slice(0, line.len() - 1);
+            }
+            let tok = scan_line(line, open.is_some(), ignore_indent);
+            match tok.kind {
+                LineKind.Blank => {
+                    pending.push(line);
+                },
+                LineKind.Comment => {
+                    pending.push(line);
+                },
+                LineKind.Continuation => {
+                    # scan_line gives Continuation only while an entry is open.
+                    let entry = open!;
+                    safe {
+                        for (waiting in pending) {
+                            entry.continuation.push(waiting);
+                        }
+                        entry.continuation.push(line);
+                    }
+                    pending = [];
+                },
+                LineKind.Header => {
+                    for (waiting in pending) {
+                        safe {
+                            current.keep(waiting);
+                        }
+                    }
+                    pending = [];
+                    current = Section(tok.name(), line);
+                    safe {
+                        doc.blocks.push(current);
+                    }
+                    open = None;
+                },
+                LineKind.Invalid => {
+                    let hint = if (line.trimStart() != line) {
+                        "an indented line continues the value above it; --ini-options=ignoreindent allows indented parameters"
+                    } else {
+                        ""
+                    };
+                    throw ParseError(path, number, line, hint);
+                },
+                _ => {
+                    for (waiting in pending) {
+                        safe {
+                            current.keep(waiting);
+                        }
+                    }
+                    pending = [];
+                    var entry = entry_from_token(tok);
+                    safe {
+                        current.adopt(edits: entry);
+                    }
+                    open = Some(entry);
+                },
+            }
+        }
+        for (waiting in pending) {
+            safe {
+                current.keep(waiting);
+            }
+        }
+        return doc;
+    }
+
+    # Sets how parameters are written: `nospace` writes new ones as
+    # `name=value`; `restyle` ("space" or "nospace") also rewrites every
+    # existing one that way, as crudini's --ini-options do.
+    pub modifier func use_style(nospace: bool, restyle: string): void {
+        this.separator = if (nospace) { "=" } else { " = " };
+        for (block in this.blocks) {
+            safe {
+                block.separator = this.separator;
+            }
+            if (restyle != "") {
+                for (entry in block.entries()) {
+                    safe {
+                        entry.restyle(restyle == "space");
+                    }
+                }
+            }
+        }
+    }
+
+    # --- queries -------------------------------------------------------------
+
+    pub func blocks_of(name: string): list[Section] {
+        var out: list[Section] = [];
+        for (block in this.blocks) {
+            if (block.name == name) {
+                out.push(block);
+            }
+        }
+        return out;
+    }
+
+    # Whether the file has a `[name]` header.
+    pub func has_section(name: string): bool {
+        for (block in this.blocks) {
+            if (block.name == name and !block.is_implicit()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    # Whether `name` can be read from: DEFAULT always can.
+    pub func exists(name: string): bool {
+        return name == DEFAULT_SECTION or this.has_section(name);
+    }
+
+    # The section names in file order, each once, without DEFAULT.
+    pub func section_names(): list[string] {
+        var seen: set[string] = set[string]();
+        var out: list[string] = [];
+        for (block in this.blocks) {
+            if (block.name != DEFAULT_SECTION and !seen.contains(block.name)) {
+                seen.add(block.name);
+                out.push(block.name);
+            }
+        }
+        return out;
+    }
+
+    # The parameters of a section, from all its blocks: each name once, in
+    # the order names first appear, as its last occurrence (the one that
+    # counts). DEFAULT's parameters are not included.
+    pub func own_entries(name: string): list[Entry] {
+        var keys: list[string] = [];
+        var last: dict[string, Entry] = {};
+        for (block in this.blocks_of(name)) {
+            for (entry in block.entries()) {
+                if (!last.containsKey(entry.key)) {
+                    keys.push(entry.key);
+                }
+                last[entry.key] = entry;
+            }
+        }
+        let out: list[Entry] = [last[key] for key in keys];
+        return out;
+    }
+
+    pub func has_defaults(): bool {
+        return this.own_entries(DEFAULT_SECTION).len() > 0;
+    }
+
+    # The entry that gives `name` its value in `section` itself.
+    pub func lookup_own(section: string, name: string): Entry? {
+        var found: Entry? = None;
+        for (block in this.blocks_of(section)) {
+            match block.find(name) {
+                Some(entry) => {
+                    found = Some(entry);
+                },
+                None => {},
+            }
+        }
+        return found;
+    }
+
+    # The entry that gives `name` its value in `section`, inherited from
+    # DEFAULT when the section does not set it.
+    pub func lookup(section: string, name: string): Entry? {
+        let own = this.lookup_own(section, name);
+        if (own.is_some() or section == DEFAULT_SECTION) {
+            return own;
+        }
+        return this.lookup_own(DEFAULT_SECTION, name);
+    }
+
+    # The block that new parameters of a section go into: its last one.
+    pub func target(name: string): Section {
+        let found = this.blocks_of(name);
+        return found[-1];
+    }
+
+    pub func has_flags(): bool {
+        for (block in this.blocks) {
+            for (entry in block.entries()) {
+                if (entry.flag) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    # --- structural edits -----------------------------------------------------
+
+    # Adds `[name]` at the end of the file, after a blank line unless the
+    # file is empty or already ends with one.
+    pub modifier func add_section(name: string): Section {
+        let lines = this.render(false, false);
+        if (lines.len() > 0 and lines[-1].trim() != "") {
+            safe {
+                this.blocks[-1].keep("");
+            }
+        }
+        let block = Section(name, "[" + name + "]");
+        safe {
+            block.separator = this.separator;
+        }
+        this.blocks.push(block);
+        return block;
+    }
+
+    # Removes every block of a section. The comment and blank lines after a
+    # block's last parameter stay in the file: they usually introduce what
+    # follows. False when the file has no such section.
+    pub modifier func remove_section(name: string): bool {
+        var kept: list[Section] = [];
+        var found = false;
+        for (block in this.blocks) {
+            if (block.name != name or block.is_implicit()) {
+                kept.push(block);
+                continue;
+            }
+            found = true;
+            var trailing: list[string] = [];
+            for (item in block.body) {
+                match item {
+                    string(text) => {
+                        trailing.push(text);
+                    },
+                    _ => {
+                        trailing = [];
+                    },
+                }
+            }
+            for (text in trailing) {
+                safe {
+                    kept[-1].keep(text);
+                }
+            }
+        }
+        this.blocks = kept;
+        return found;
+    }
+
+    # Every entry of a section named `name`, from all its blocks.
+    pub func matching(section: string, name: string): list[Entry] {
+        let key = name.toLowerCase();
+        var out: list[Entry] = [];
+        for (block in this.blocks_of(section)) {
+            for (entry in block.entries()) {
+                if (entry.key == key) {
+                    out.push(entry);
+                }
+            }
+        }
+        return out;
+    }
+
+    # Removes the global parameters (every field of the DEFAULT blocks) and
+    # any `[DEFAULT]` header.
+    pub modifier func clear_defaults(): void {
+        for (block in this.blocks_of(DEFAULT_SECTION)) {
+            safe {
+                for (name in block.fieldNames()) {
+                    block.deleteField(name);
+                }
+                block.header = "";
+            }
+        }
+    }
+
+    # Gives the global parameters an explicit `[DEFAULT]` header, at the top
+    # of the file, where crudini puts it.
+    pub modifier func add_default_header(): void {
+        safe {
+            this.blocks[0].header = "[" + DEFAULT_SECTION + "]";
+        }
+    }
+
+    # --- output -----------------------------------------------------------------
+
+    # The document as lines. `sectionspace` leaves exactly one blank line
+    # before each header and none at either end; `tidy` (after a section was
+    # removed) collapses runs of blank lines and drops blank lines at the
+    # start and end of the file and right after a header, as iniparse's
+    # tidy() does.
+    pub func render(sectionspace: bool, tidy: bool): list[string] {
+        var out: list[string] = [];
+        var headers: list[bool] = [];
+        for (block in this.blocks) {
+            let lines = block.render();
+            if (sectionspace and !block.is_implicit()) {
+                while (out.len() > 0 and out[-1].trim() == "") {
+                    out.pop();
+                    headers.pop();
+                }
+                if (out.len() > 0) {
+                    out.push("");
+                    headers.push(false);
+                }
+            }
+            for (k in 0..lines.len()) {
+                out.push(lines[k]);
+                headers.push(k == 0 and !block.is_implicit());
+            }
+        }
+        if (!sectionspace and !tidy) {
+            return out;
+        }
+        var clean: list[string] = [];
+        var after_header = false;
+        for (k in 0..out.len()) {
+            let blank = out[k].trim() == "";
+            if (blank and (clean.len() == 0 or after_header or (tidy and clean[-1].trim() == ""))) {
+                after_header = false;
+                continue;
+            }
+            clean.push(out[k]);
+            after_header = tidy and headers[k];
+        }
+        while (clean.len() > 0 and clean[-1].trim() == "") {
+            clean.pop();
+        }
+        return clean;
+    }
+
+    # The lines as they go into the file: the byte order mark and CR line
+    # ends put back.
+    pub func encode(lines: list[string]): list[string] {
+        var out: list[string] = [];
+        for (k in 0..lines.len()) {
+            var line = lines[k];
+            if (k == 0 and this.bom) {
+                line = BOM + line;
+            }
+            if (this.crlf) {
+                line = line + "\r";
+            }
+            out.push(line);
+        }
+        return out;
+    }
+}

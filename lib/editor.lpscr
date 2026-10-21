@@ -1,0 +1,345 @@
+@mode(host.scripted)
+
+# crudini's operations on a document: --get, --set, --del and --merge, ported
+# from crudini's command_get, set_name_value, command_del and command_merge.
+#
+# Runtime: host.scripted. A module of the script bin/crudini.lpscr,
+# interpreted with it by `loup run`; the unit tests import it under Stage0's
+# test runner (`loup-bootstrap test --no-parallel --file`).
+#
+# Structure: an Editor is made once per run from the Settings (read through
+# a dynamic view) and the document; apply() runs one operation. --get
+# appends what it prints to `output`; the other operations change the
+# document. set_value() is the heart of --set, --merge and a list --del:
+# it checks --existing, adds a missing section, works out the new value
+# (a bare name, an emptied or updated list) and stores it. Missing sections
+# and parameters throw NoSectionError and NoOptionError, as in crudini.
+
+from data.ini import (sections, getSection, getValue);
+from .options import (Mode, Operation, Settings, existing_mode, list_separator);
+from .document import (IniDocument, DEFAULT_SECTION);
+from .printers import (Printer);
+from .listval import (ListSep, update_list);
+from .errors import (NoSectionError, NoOptionError);
+
+pub class Editor {
+    pub let doc: IniDocument;
+    pub var output: list[string] = [];
+    pub var removed_section: bool = false;
+    let format: string;
+    let list_mode: bool;
+    # "" when --existing was not given, else file, section or param.
+    let existing: string;
+    let list_sep: ListSep;
+    let printer: Printer;
+
+    new(settings: Settings, doc: IniDocument, nospace: bool) {
+        this.doc = doc;
+        # The plain settings, read through a dynamic view: each field is
+        # what parse_command_line stored under that name. (The locals are
+        # not named like the fields they fill: Stage0 would assign the
+        # field instead.)
+        var chosen_format = "";
+        var as_list = false;
+        dynamic settings as s {
+            let given_format: string = s.format;
+            let given_list: bool = s.list;
+            chosen_format = given_format;
+            as_list = given_list;
+        }
+        this.format = chosen_format;
+        this.list_mode = as_list;
+        this.existing = existing_mode(settings);
+        this.list_sep = list_separator(settings);
+        this.printer = Printer.for_format(chosen_format, nospace);
+    }
+
+    # --existing=param or =section (or --existing alone): items must exist.
+    func strict(): bool {
+        return this.existing == "param" or this.existing == "section";
+    }
+
+    pub modifier func apply(op: Operation, input: dict[string, dict[string, string]]): void {
+        match op.mode {
+            Mode.Get => {
+                this.get(op);
+            },
+            Mode.Set => {
+                this.set_value(Mode.Set, op.section!, op.param, op.value);
+            },
+            Mode.Del => {
+                this.delete(op);
+            },
+            Mode.Merge => {
+                this.merge(op, input);
+            },
+        }
+    }
+
+    # --- --get ----------------------------------------------------------------
+
+    # The value of a parameter, inherited from DEFAULT when the section does
+    # not set it.
+    func value_of(section: string, param: string): string {
+        if (!this.doc.exists(section)) {
+            throw NoSectionError(section);
+        }
+        match this.doc.lookup(section, param) {
+            Some(entry) => {
+                return entry.full_value;
+            },
+            None => {
+                throw NoOptionError(param);
+            },
+        }
+    }
+
+    # The sections a whole-file listing shows: DEFAULT first when it has
+    # parameters.
+    func listed_sections(): list[string] {
+        var names: list[string] = [];
+        if (this.doc.has_defaults()) {
+            names.push(DEFAULT_SECTION);
+        }
+        for (name in this.doc.section_names()) {
+            names.push(name);
+        }
+        return names;
+    }
+
+    modifier func get(op: Operation): void {
+        let plain = this.format == "" or this.format == "ini";
+        match op.section {
+            None => {
+                for (name in this.listed_sections()) {
+                    if (plain) {
+                        this.output.push(this.printer.section_header(name));
+                    } else {
+                        # sh names other sections' parameters SECTION_NAME,
+                        # DEFAULT's just NAME.
+                        let shown: string? = if (this.format == "sh" and name == DEFAULT_SECTION) { None } else { Some(name) };
+                        this.list_section(name, shown);
+                    }
+                }
+            },
+            Some(section) => {
+                match op.param {
+                    Some(param) => {
+                        let value = this.value_of(section, param);
+                        if (plain) {
+                            let name: string? = if (this.format == "") { None } else { Some(param) };
+                            this.output.push(this.printer.name_value(name, Some(value), None));
+                        } else {
+                            let shown: string? = if (this.format == "sh") { None } else { Some(section) };
+                            this.output.push(this.printer.name_value(Some(param), Some(value), shown));
+                        }
+                    },
+                    None => {
+                        if (!this.doc.exists(section)) {
+                            throw NoSectionError(section);
+                        }
+                        if (!plain) {
+                            let shown: string? = if (this.format == "sh") { None } else { Some(section) };
+                            this.list_section(section, shown);
+                            return;
+                        }
+                        if (this.format == "ini") {
+                            this.output.push(this.printer.section_header(section));
+                        }
+                        for (entry in this.doc.own_entries(section)) {
+                            let value: string? = if (this.format == "") { None } else { Some(entry.full_value) };
+                            this.output.push(this.printer.name_value(Some(entry.name), value, None));
+                        }
+                    },
+                }
+            },
+        }
+    }
+
+    # One section in the lines or sh format. Lines still names an empty
+    # section; sh prints nothing for it.
+    modifier func list_section(section: string, shown: string?): void {
+        let entries = this.doc.own_entries(section);
+        for (entry in entries) {
+            this.output.push(this.printer.name_value(Some(entry.name), Some(entry.full_value), shown));
+        }
+        if (entries.len() == 0 and this.format != "sh") {
+            this.output.push(this.printer.name_value(None, None, shown));
+        }
+    }
+
+    # --- --set, and what --merge and --del --list share --------------------
+
+    # Sets `param` in `section` (or only makes sure the section exists when
+    # `param` is None). `value` None means none was given.
+    modifier func set_value(mode: Mode, section: string, param: string?, value: string?): void {
+        if (this.strict()) {
+            if (!this.doc.exists(section)) {
+                throw NoSectionError(section);
+            }
+            match param {
+                Some(name) => {
+                    if (this.existing == "param" and this.doc.lookup(section, name).is_none()) {
+                        throw NoOptionError(name);
+                    }
+                },
+                None => {},
+            }
+        } else if (!this.doc.exists(section)) {
+            if (mode == Mode.Del) {
+                return;
+            }
+            safe {
+                this.doc.add_section(section);
+            }
+        }
+        if (param.is_none()) {
+            return;
+        }
+        let name = param!;
+        # The current value counts inheritance from DEFAULT, as in crudini:
+        # a list in DEFAULT is extended into the section.
+        let current = this.doc.lookup(section, name);
+        if (current.is_none() and mode == Mode.Del) {
+            return;
+        }
+        var text = value ?? "";
+        var flag = false;
+        if (value.is_none() and !this.list_mode) {
+            match current {
+                Some(entry) => {
+                    if (entry.flag) {
+                        # Already there as a bare name: nothing to do.
+                        return;
+                    }
+                },
+                None => {
+                    # A file that writes some parameters as bare names gets
+                    # new value-less ones the same way.
+                    flag = this.doc.has_flags();
+                },
+            }
+        }
+        if (this.list_mode) {
+            var listed = "";
+            if (value.is_some()) {
+                match current {
+                    Some(entry) => {
+                        listed = entry.full_value;
+                    },
+                    None => {},
+                }
+            }
+            text = update_list(listed, text, mode != Mode.Del, this.list_sep);
+        }
+        match this.doc.lookup_own(section, name) {
+            Some(entry) => {
+                safe {
+                    entry.assign(text, this.doc.separator);
+                }
+            },
+            None => {
+                let block = this.doc.target(section);
+                safe {
+                    if (flag) {
+                        block.setField(name, true);
+                    } else {
+                        block.setField(name, text);
+                    }
+                }
+            },
+        }
+    }
+
+    # --- --del ------------------------------------------------------------------
+
+    modifier func delete(op: Operation): void {
+        let section = op.section!;
+        match op.param {
+            None => {
+                if (section == DEFAULT_SECTION) {
+                    safe {
+                        this.doc.clear_defaults();
+                    }
+                    return;
+                }
+                var removed = false;
+                safe {
+                    removed = this.doc.remove_section(section);
+                }
+                if (removed) {
+                    this.removed_section = true;
+                } else if (this.strict()) {
+                    throw NoSectionError(section);
+                }
+            },
+            Some(name) => {
+                if (op.value.is_some()) {
+                    # --list: remove one item from the value.
+                    this.set_value(Mode.Del, section, op.param, op.value);
+                    return;
+                }
+                if (!this.doc.exists(section)) {
+                    if (this.strict()) {
+                        throw NoSectionError(section);
+                    }
+                    return;
+                }
+                # Each occurrence removes itself from whichever block holds
+                # it, through its back-pointer.
+                let found = this.doc.matching(section, name);
+                for (entry in found) {
+                    entry.detach();
+                }
+                if (found.len() == 0 and this.existing == "param") {
+                    throw NoOptionError(name);
+                }
+            },
+        }
+    }
+
+    # --- --merge ------------------------------------------------------------------
+
+    # Sets every parameter of `input` (data.ini's document of standard input,
+    # global parameters under "") in the file: section by section, or all of
+    # them into the operation's section when it names one.
+    modifier func merge(op: Operation, input: dict[string, dict[string, string]]): void {
+        var sources: list[string] = [""];
+        for (name in sections(input)) {
+            if (name != "") {
+                sources.push(name);
+            }
+        }
+        for (source in sources) {
+            let into = op.section ?? (if (source == "") { DEFAULT_SECTION } else { source });
+            let items: dict[string, string] = getSection(input, source).unwrap_or({});
+            var set_any = false;
+            for (name in items.keys()) {
+                let value = items[name];
+                # A section's parameter that equals the input's own DEFAULT
+                # value adds nothing; crudini skips it.
+                if (source != "") {
+                    match getValue(input, "", name) {
+                        Some(fallback) => {
+                            if (fallback == value) {
+                                continue;
+                            }
+                        },
+                        None => {},
+                    }
+                }
+                set_any = true;
+                try {
+                    this.set_value(Mode.Merge, into, Some(name), Some(value));
+                } catch (NoOptionError as e) {
+                    # --existing=param merges only the parameters already
+                    # in the file.
+                }
+            }
+            # An input section without parameters still gets its header.
+            if (!set_any and op.section.is_none()) {
+                this.set_value(Mode.Merge, into, None, None);
+            }
+        }
+    }
+}

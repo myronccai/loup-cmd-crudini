@@ -1,0 +1,61 @@
+@mode(host.scripted)
+
+# Unit tests for crudini's --get output formats (lib/printers.lpscr).
+#
+# Runtime: host.scripted, run by the test runner: `make test` interprets
+# this file with Stage0 (`loup-bootstrap test --no-parallel --file`), one
+# test per `func test_*()`. It imports lib/ with relative imports. It is not
+# part of the program.
+
+from debug.assert import (expect, expectEq);
+from ..lib.printers import (Printer, IniPrinter, LinesPrinter, ShPrinter, is_sh_identifier);
+from ..lib.errors import (ShIdentifierError);
+
+func test_factory(): void {
+    expect(Printer.for_format("ini", false) is IniPrinter, "ini");
+    expect(Printer.for_format("lines", false) is LinesPrinter, "lines");
+    expect(Printer.for_format("sh", false) is ShPrinter, "sh");
+    expect(!(Printer.for_format("", false) is IniPrinter), "plain");
+}
+
+func test_plain(): void {
+    let p = Printer.for_format("", false);
+    expectEq(p.section_header("db"), "db", "header");
+    expectEq(p.name_value(Some("port"), None, None), "port", "name");
+    expectEq(p.name_value(None, Some("a\nb"), None), "a\nb", "value as is");
+}
+
+func test_ini(): void {
+    let p = Printer.for_format("ini", false);
+    expectEq(p.section_header("db"), "[db]", "header");
+    expectEq(p.name_value(Some("msg"), Some("a\nb"), None), "msg = a\n b", "continuation");
+    expectEq(Printer.for_format("ini", true).name_value(Some("k"), Some("v"), None), "k=v", "nospace");
+}
+
+func test_lines(): void {
+    let p = Printer.for_format("lines", false);
+    expectEq(p.name_value(Some("k"), Some("a\nb"), Some("s")), "[ s ] k = a\\nb", "escaped newline");
+    expectEq(p.name_value(Some("flag"), Some(""), Some("s")), "[ s ] flag", "no value");
+    expectEq(p.name_value(None, None, Some("empty")), "[ empty ]", "empty section");
+}
+
+func test_sh(): void {
+    let p = Printer.for_format("sh", false);
+    expectEq(p.name_value(Some("port"), Some("80"), Some("db")), "db_port=80", "prefixed");
+    expectEq(p.name_value(Some("msg"), Some("it's"), None), "msg='it'\\''s'", "quoted");
+    expectEq(p.name_value(Some("e"), Some(""), None), "e=''", "empty");
+    var bad = "";
+    try {
+        p.name_value(Some("rm -rf /;x"), Some("1"), None);
+    } catch (ShIdentifierError as e) {
+        bad = e.identifier;
+    }
+    expectEq(bad, "rm -rf /;x", "refused");
+}
+
+func test_sh_identifiers(): void {
+    expect(is_sh_identifier("_a1"), "letters, digits, underscore");
+    expect(!is_sh_identifier("1a"), "digit first");
+    expect(!is_sh_identifier("a-b"), "dash");
+    expect(!is_sh_identifier(""), "empty");
+}

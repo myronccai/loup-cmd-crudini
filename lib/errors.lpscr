@@ -1,0 +1,60 @@
+@mode(host.scripted)
+
+# crudini's exceptions: what an operation reports when the file lacks a
+# section or parameter it needs, cannot be parsed, or holds a name that
+# --format=sh cannot print.
+#
+# Runtime: host.scripted. A module of the script bin/crudini.lpscr,
+# interpreted with it by `loup run`; the unit tests import it under Stage0's
+# test runner (`loup-bootstrap test --no-parallel --file`).
+
+# Every error crudini reports with exit status 1 after the command line was
+# accepted. bin/crudini.lpscr catches this base class and prints the
+# message; the subclasses carry the detail that the tests look at.
+pub class CrudiniError : Exception {
+    new(message: string) {
+        super(message);
+    }
+}
+
+pub class NoSectionError : CrudiniError {
+    pub let section: string;
+
+    new(section: string) {
+        super("Section not found: " + section);
+        this.section = section;
+    }
+}
+
+pub class NoOptionError : CrudiniError {
+    pub let param: string;
+
+    new(param: string) {
+        super("Parameter not found: " + param);
+        this.param = param;
+    }
+}
+
+# A line the reader cannot place, with its 1-based number. `hint` says what
+# to do about it, or is empty.
+pub class ParseError : CrudiniError {
+    pub let line: int;
+
+    new(path: string, line: int, text: string, hint: string) {
+        var message = path + ":" + str(line) + ": cannot parse '" + text + "'";
+        if (hint != "") {
+            message = message + " (" + hint + ")";
+        }
+        super(message);
+        this.line = line;
+    }
+}
+
+pub class ShIdentifierError : CrudiniError {
+    pub let identifier: string;
+
+    new(identifier: string) {
+        super("Invalid sh identifier \"" + identifier + "\"");
+        this.identifier = identifier;
+    }
+}

@@ -1,7 +1,11 @@
 # AGENTS.md
 
-This repository is a GitHub template for building a command-line application
-in the Loup programming language. The program is built as a native executable.
+This repository is `crudini`, a recreation of Pádraig Brady's crudini (query
+and edit INI files from the command line) written in the Loup programming
+language, part of the loup-cmd series of example applications. It is a
+`host.scripted` project: the program is the `.lpscr` script
+`bin/crudini.lpscr`, which `loup run` executes from source, over modules in
+`lib/`. Nothing is compiled.
 
 ## Skills
 
@@ -19,93 +23,105 @@ mistakes. Load those only as needed.
 
 ```text
 .
-├── package.lppkg                # Loup manifest: name, version, toolchain, [build] entry, [test] pattern
-├── Makefile                     # run, check, test, build, ci, clean
-├── LICENSE                      # MIT license (copyright Code Craft AI LLC)
-├── source/                      # all Loup code; modules import each other by path from here
-│   ├── main.loup                # entry point: func main() calls run(runtime.args())
-│   ├── appinfo.loup             # APP_NAME, APP_VERSION, APP_SUMMARY, exit statuses
-│   ├── cli/
-│   │   ├── args.loup            # struct Options, parse_args()
-│   │   ├── usage.loup           # usage(), version_line()
-│   │   └── app.loup             # run(), dispatch(): routes commands, maps errors to exit statuses
-│   └── commands/                # one module per command
-│       └── hello.loup           # sample command: run_hello()
-├── tests/                       # tests: <module>_test.loup files with func test_*(): void
-│   ├── app_test.loup
-│   ├── args_test.loup
-│   └── hello_test.loup
-├── specs/                       # feature specs: <feature>/requirements.md, design.md, tasks.md
-│   ├── README.md
-│   └── command-line-interface/
+├── package.lppkg                # manifest: name, version, toolchain, [build] entry (bin/crudini.lpscr), [test] pattern
+├── Makefile                     # run, check, test, e2e, ci, clean
+├── bin/
+│   └── crudini.lpscr            # the command: arguments, reading, operations, writing, exit status
+├── lib/                         # modules; host.scripted unless noted
+│   ├── appinfo.loup             # host.dual: APP_NAME, APP_VERSION, APP_SUMMARY, exit statuses
+│   ├── usage.loup               # host.dual: usage(), version_line()
+│   ├── options.lpscr            # Mode, Operation, option table, dynamic class Settings, setting_flag!/setting_text!, parse_command_line()
+│   ├── lexer.lpscr              # LineKind, LineToken[~src] (borrows its line), scan_line()
+│   ├── entry.lpscr              # class Entry (a parameter; weak back-pointer to its section)
+│   ├── section.lpscr            # class Section implements Dynamic (body: list[Entry | string])
+│   ├── document.lpscr           # class IniDocument: read, queries, add/remove sections, render, encode
+│   ├── editor.lpscr             # class Editor: --get, --set, --del, --merge, --existing, lists
+│   ├── listval.lpscr            # enum ListSep, update_list()
+│   ├── printers.lpscr           # Printer and its subclasses, one per --format
+│   ├── storage.lpscr            # read_config(), replace_file(), rewrite_in_place()
+│   └── errors.lpscr             # CrudiniError, NoSectionError, NoOptionError, ParseError, ShIdentifierError
+├── tests/
+│   ├── *_test.lpscr             # unit tests: func test_*(): void
+│   ├── e2e.sh                   # end-to-end tests: runs the script with loup run
+│   └── fixtures/app.ini         # sample configuration
+├── specs/crudini/               # requirements.md, design.md, tasks.md
 ├── skills/loup-programmer/      # the Loup skill and its references
-├── .github/workflows/ci.yml     # installs Loup and runs `make ci`
-└── build/                       # build output (git-ignored)
+└── .github/workflows/ci.yml     # installs Loup and runs `make ci`
 ```
 
-## Build, run and test
+## Check, run and test
 
-Prerequisites: Loup 1.26.0 (`loup` and `loup-bootstrap` on `PATH`), `make`,
-and `clang` 17 or later for native builds.
+Prerequisites: Loup 1.26.0 (`loup` and `loup-bootstrap` on `PATH`), `make`
+and `bash`.
 
 Loup Lite comes from <https://github.com/code-craft-ai-company/loup-releases>;
 [README.md](README.md#installing-loup-lite) has the install commands.
 
 | Task | Command | Notes |
 |------|---------|-------|
-| Run from source | `make run ARGS="hello Ann --shout"` | `loup run source/main.loup -- ARGS` |
-| Type-check | `make check` | checks `source/main.loup` and every module it imports; tests are not checked |
-| Run all tests | `make test` | every `tests/*_test.loup` |
-| Run matching tests | `make test TEST_ARGS="--filter value"` | tests whose name contains `value` |
-| Run one test file | `make test TEST_ARGS="--file tests/args_test.loup"` | |
-| Build | `make build` | native binary at `build/myapp` |
-| Run the binary | `build/myapp --help` | |
-| Everything CI runs | `make ci` | check, test, build, then `build/myapp --version` |
+| Run from source | `make run ARGS="--get tests/fixtures/app.ini database"` | `loup run bin/crudini.lpscr -- ARGS` |
+| Run directly | `./bin/crudini.lpscr -- --get FILE SECTION` | every option is long, so all go after `--` |
+| Type-check | `make check` | `loup-bootstrap check FILE` for `bin/crudini.lpscr` and the modules it imports |
+| Unit tests | `make test` | each `tests/*_test.lpscr` in turn; files go under `build/tmp/` |
+| One test file | `make test TESTS=tests/editor_test.lpscr` | |
+| Matching tests | `make test TEST_ARGS="--filter merge"` | tests whose name contains `merge` |
+| End-to-end tests | `make e2e` | `tests/e2e.sh`: output, files and exit status of `loup run` |
+| Everything CI runs | `make ci` | check, test, e2e, then `--version` |
 | Clean | `make clean` | removes `build/` and `.temp/` |
 
-Run `make ci` before reporting a change as done. `loup run` and the native
-build do not support the same things, so a change can pass `make test` and
-still fail `make build`.
+Run `make ci` before reporting a change as done. Unit tests run under Stage0
+(`loup-bootstrap`); the script runs under the self-hosted `loup run`, which
+behaves differently in places (below), so only `make e2e` shows what users get.
 
-Do not call `loup test` or `loup check` directly on Linux x86-64. There `loup`
-is the self-hosted driver: it refuses `check`, and its test runner cannot
-resolve this project's imports. The Makefile uses `loup-bootstrap` (Stage0) for
-both, and sets `LOUPPATH=source` for tests.
+Toolchain facts this project depends on (Loup 1.26.0, Linux x86-64):
+
+- A script entry cannot be built (`E-BUILD-COMPILED`), so there is no build
+  target. `loup-bootstrap check FILE` does type-check a script and its
+  imports; `[build] entry` points at `bin/crudini.lpscr`.
+- `loup run SCRIPT --long` treats `--long` as its own flag; the self-hosted
+  driver drops it silently. crudini's options are all long: they go after
+  `--` (`loup run bin/crudini.lpscr -- --get app.ini`).
+- The self-hosted `loup run` cannot catch `IoError`; check `exists`/`isDir`
+  before reading (`read_problem`).
+- Stage0 (the unit tests) assigns the class FIELD when a method assigns a
+  local `var` with the same name. Do not name method locals like fields.
+- A struct field cannot hold a union (`E_STRUCT_CLASS_FIELD`): `OptionSpec`
+  is a class. A union is passed to `Any` with `box v`.
+- `x in xs`, `?.`, interpolation filters and `"""` strings do not work under
+  the self-hosted `loup run`; lists have no `insert` (slice and `+`).
+- A test that reads `obj!{field}` on a type it does not import directly gets
+  `E_DYNAMIC_ACCESS_NOT_DYNAMIC`: import the class (`Section`) in the test.
+- `loup-bootstrap test` with all files at once fails random tests with an
+  empty `RuntimeError` on a busy machine; the Makefile runs one file at a
+  time with `--no-parallel`.
 
 ## Making a change
 
-1. Write or update the spec in `specs/<feature>/` (see [specs/README.md](specs/README.md)).
-2. Change the code under `source/`.
-3. Add or update tests in `tests/`.
+1. Update the spec in `specs/crudini/` (see [specs/README.md](specs/README.md)).
+2. Change the code: behaviour in `lib/`, top-level flow in `bin/`.
+3. Add or update unit tests in `tests/` and cases in `tests/e2e.sh` (edits are
+   checked as `diff tests/fixtures/app.ini RESULT`).
 4. Run `make ci`.
-5. Tick the finished tasks in `specs/<feature>/tasks.md`.
+5. Tick the finished tasks in `specs/crudini/tasks.md`.
 
-To add a command:
-
-1. Create `source/commands/<name>.loup` with `@mode(host.dual)` and
-   `pub func run_<name>(opts: Options): int`, returning an exit status from
-   `appinfo`.
-2. Add an arm for it to `dispatch` in `source/cli/app.loup`.
-3. Describe it in `usage()` in `source/cli/usage.loup`.
-4. Add any new options to `Options` and `parse_args` in `source/cli/args.loup`.
-5. Add `tests/<name>_test.loup`.
+Keep behaviour in classes and functions that return values (the `Editor`
+collects `--get` output, the document renders lines), so unit tests can
+check it; only `bin/crudini.lpscr` prints, reads files and calls `exit`.
 
 ## Conventions
 
-- Every source file is `@mode(host.dual)` with the `.loup` extension. Only
-  `source/main.loup` has a `main()`.
-- Modules import each other by path from `source/`:
-  `from cli.args import (Options);`. Tests import them the same way. Do not
-  use relative imports (`from .args import ...`): the self-hosted `loup run`
-  on Linux x86-64 fails on them.
-- Struct fields read from another module must be `pub`.
-- The native build supports less than `loup run` does. For example,
-  `list.is_empty()` fails native codegen (`E-CODEGEN-UNHANDLED-METHOD`); use
-  `len() == 0`.
-- Keep `APP_VERSION` in `source/appinfo.loup` equal to `version` in
+- `bin/crudini.lpscr` is `@mode(host.scripted)` with a
+  `#!/usr/bin/env -S loup run` line and the executable bit.
+- `lib/*.lpscr` are `@mode(host.scripted)`: they use sets, unions matched by
+  type and `Any`, which only the interpreters run. `lib/appinfo.loup` and
+  `lib/usage.loup` are `host.dual` and hold nothing a native build lacks.
+- Imports are relative: `from ..lib.options import (...)` in `bin/` and
+  `tests/`, `from .entry import (...)` inside `lib/`.
+- A method that changes `this` is `modifier`, and callers wrap the call in
+  `safe { ... }`; a function that changes a parameter declares it `edits`.
+- Error messages are `crudini: MESSAGE` on standard error; every failure
+  exits with status 1, as crudini does.
+- Keep `APP_VERSION` in `lib/appinfo.loup` equal to `version` in
   `package.lppkg`.
-- The skill's examples use the `loup init` layout (`src/`, `tests/`, and
-  `from ..src.x import` in tests). This project uses `source/` and
-  `tests/` with plain imports; follow this file.
-- The skill documents toolchain 1.25.1; this template targets 1.26.0. When
+- The skill documents toolchain 1.25.1; this project targets 1.26.0. When
   they disagree, trust the toolchain's behaviour.

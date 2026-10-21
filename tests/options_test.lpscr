@@ -1,0 +1,114 @@
+@mode(host.scripted)
+
+# Unit tests for crudini's command line (lib/options.lpscr): grouping words
+# into operations, the option table and its Settings namespace, prefixes,
+# the global section's two spellings, and every usage error.
+#
+# Runtime: host.scripted, run by the test runner: `make test` interprets
+# this file with Stage0 (`loup-bootstrap test --no-parallel --file`), one
+# test per `func test_*()`. It imports lib/ with relative imports. It is not
+# part of the program.
+
+from debug.assert import (expect, expectEq);
+from ..lib.options import (Mode, Request, Settings, parse_command_line, mode_word, setting_flag, setting_text, existing_mode, list_separator, ini_options);
+from ..lib.listval import (ListSep);
+
+func ok(argv: list[string]): Request {
+    return parse_command_line(argv).unwrap();
+}
+
+func err(argv: list[string]): string {
+    match parse_command_line(argv) {
+        Ok(request) => {
+            return "accepted";
+        },
+        Err(problem) => {
+            return problem.message;
+        },
+    }
+}
+
+# An operation as one line: mode and operands, "-" for a missing one.
+func shown(request: Request, k: int): string {
+    let op = request.operations[k];
+    return [mode_word(op.mode), op.file, op.section ?? "-", op.param ?? "-", op.value ?? "-"].join(" ");
+}
+
+func test_operations(): void {
+    let r = ok(["--set", "a.ini", "db", "port", "1", "--del", "a.ini", "db", "old"]);
+    expectEq(r.operations.len(), 2, "two operations");
+    expectEq(shown(r, 0), "--set a.ini db port 1", "first");
+    expectEq(shown(r, 1), "--del a.ini db old -", "second");
+    expectEq(shown(ok(["--get", "a.ini"]), 0), "--get a.ini - - -", "file only");
+    expectEq(shown(ok(["--set", "a.ini", "s", "--", "--p", "-v"]), 0), "--set a.ini s --p -v", "after --");
+}
+
+func test_settings_namespace(): void {
+    let settings: Settings = ok(["--inplace", "--format=lines", "--get", "a.ini", "--out", "o.ini"]).settings;
+    expect(setting_flag!(settings, "inplace"), "flag");
+    expect(!setting_flag!(settings, "verbose"), "flag left at its initial value");
+    expectEq(setting_text!(settings, "format"), "lines", "attached value");
+    expectEq(setting_text!(settings, "output"), "o.ini", "unique prefix, separate value");
+    dynamic settings as s {
+        let fmt: string = s.format;
+        expectEq(fmt, "lines", "dynamic view");
+    }
+    expectEq(settings.program, "crudini", "declared field");
+}
+
+func test_typed_settings(): void {
+    expectEq(existing_mode(ok(["--get", "f"]).settings), "", "not given");
+    expectEq(existing_mode(ok(["--existing", "--set", "f", "s"]).settings), "param", "alone");
+    expectEq(existing_mode(ok(["--existing=", "--set", "f", "s"]).settings), "param", "empty");
+    expectEq(existing_mode(ok(["--existing=file", "--set", "f", "s"]).settings), "file", "named");
+    expect(list_separator(ok(["--get", "f"]).settings) == ListSep.Commas, "default separator");
+    expect(list_separator(ok(["--list-sep=", "--get", "f"]).settings) == ListSep.Whitespace, "empty separator");
+    expect(list_separator(ok(["--list-sep", ";", "--get", "f"]).settings) == ListSep.Text(sep = ";"), "text separator");
+    let names = ini_options(ok(["--ini-options=nospace,sectionspace", "--get", "f"]).settings);
+    expect(names.contains("nospace") and names.contains("sectionspace") and names.len() == 2, "ini options");
+}
+
+func test_global_section(): void {
+    let r = ok(["--set", "f", "", "a", "1", "--set", "f", "", "b", "2"]);
+    expectEq(r.operations[0].section ?? "", "DEFAULT", "\"\" means DEFAULT");
+    expect(!r.explicit_default, "named \"\"");
+    expect(ok(["--set", "f", "DEFAULT", "a", "1"]).explicit_default, "named DEFAULT");
+    expectEq(err(["--set", "f", "DEFAULT", "a", "1", "--set", "f", "", "b", "2"]), "Conflicting DEFAULT section specifications", "both spellings");
+}
+
+func test_help_and_version_stop_parsing(): void {
+    expect(setting_flag!(ok(["--help"]).settings, "help"), "--help needs no operation");
+    expect(setting_flag!(ok(["--version", "--get"]).settings, "version"), "--version needs no file");
+    expectEq(err(["--version", "--bogus"]), "option --bogus not recognized", "unknown options are found first");
+    expectEq(err(["--format=xml", "--help"]), "--format not recognized: xml", "checked in order");
+}
+
+func test_option_errors(): void {
+    expectEq(err(["--bogus"]), "option --bogus not recognized", "unknown");
+    expectEq(err(["--in", "--get", "f"]), "option --in not a unique prefix", "ambiguous");
+    expectEq(err(["--format"]), "option --format requires argument", "missing value");
+    expectEq(err(["--verbose=1"]), "option --verbose must not have an argument", "unexpected value");
+    expectEq(err(["--existing=all", "--get", "f"]), "--existing item not recognized: all", "existing");
+    expectEq(err(["--ini-options=tabs", "--get", "f"]), "--ini-options not recognized: tabs", "ini option");
+    expectEq(err(["--ini-options=space,nospace", "--get", "f"]), "--ini-options=space,nospace are mutually exclusive", "space and nospace");
+}
+
+func test_operation_errors(): void {
+    expectEq(err([]), "One of --set|--del|--get|--merge must be specified", "nothing");
+    expectEq(err(["a.ini"]), "Unknown operation: a.ini", "word first");
+    expectEq(err(["--get", "a", "--set", "a", "s"]), "--get|--merge modes can't be mixed with --set|--del", "mixed");
+    expectEq(err(["--merge", "a", "--merge", "a"]), "--merge mode can't be repeated", "two merges");
+    expectEq(err(["--set", "a", "s", "--set", "b", "s"]), "Can't operate on multiple files", "two files");
+    expectEq(err(["--set"]), "missing config_file after --set", "no file");
+    expectEq(err(["--del", "a"]), "missing section after --del a", "no section");
+    expectEq(err(["--set", "a", "s", "p", "v", "w"]), "extra operand 'w' for --set", "too many");
+    expectEq(err(["--merge", "a", "s", "p"]), "extra operand 'p' for --merge", "merge takes a section only");
+    expectEq(err(["--get", "a", "s", "p", "v"]), "A value should not be specified with --get", "value");
+    expectEq(err(["--del", "a", "s", "p", "v"]), "A value should not be specified with --del", "value without --list");
+    expectEq(err(["--list", "--del", "a", "s", "p", "v"]), "accepted", "list removal");
+    expectEq(err(["--format=sh", "--merge", "a"]), "sh format input is not supported at present", "sh merge");
+    expectEq(err(["--merge", "-"]), "--merge reads its input from standard input, so config_file cannot be -", "merge from stdin");
+    expectEq(err(["--set", "a", "x]y"]), "section names should not contain '[' or ']': x]y", "bracket");
+    expectEq(err(["--set", "a", "s", "[p"]), "param names should not start with '[': [p", "param bracket");
+    expectEq(err(["--set", "a", "s", "p=q"]), "param names should not contain '=': p=q", "param equals");
+}

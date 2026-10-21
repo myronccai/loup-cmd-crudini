@@ -1,0 +1,221 @@
+@mode(host.scripted)
+
+# crudini's section: a header line and the parameters and other lines under
+# it, up to the next header. A Section is a dynamic object whose fields are
+# its parameters: `sec!{port}` reads one, `sec.setField("port", "80")` sets
+# or adds one.
+#
+# Runtime: host.scripted. A module of the script bin/crudini.lpscr,
+# interpreted with it by `loup run`; the unit tests import it under Stage0's
+# test runner (`loup-bootstrap test --no-parallel --file`).
+#
+# Structure: the body is a list of `Entry | string`, a union: a parameter
+# is an Entry, any other line (a comment, a blank line) is kept as the
+# string it was read as. Rendering walks the body and matches each item by
+# its type. Then come the Dynamic methods, which the editor uses to change
+# parameters by name.
+
+from .entry import (Entry);
+
+pub class Section implements Dynamic {
+    pub let name: string;
+    # The header line as read, or "" for the parameters before the first
+    # header (the implicit part of the DEFAULT section).
+    pub var header: string;
+    pub var body: list[Entry | string] = [];
+    # How setField writes a new parameter: its separator and its indent
+    # (the last indent seen in the section, for --ini-options=ignoreindent).
+    pub var separator: string = " = ";
+    pub var indent: string = "";
+
+    new(name: string, header: string) {
+        this.name = name;
+        this.header = header;
+    }
+
+    pub func is_implicit(): bool {
+        return this.header == "";
+    }
+
+    pub func entries(): list[Entry] {
+        var out: list[Entry] = [];
+        for (item in this.body) {
+            if (item is Entry) {
+                out.push(item);
+            }
+        }
+        return out;
+    }
+
+    # The last entry whose name matches `name` (case-insensitively).
+    pub func find(name: string): Entry? {
+        let key = name.toLowerCase();
+        var found: Entry? = None;
+        for (entry in this.entries()) {
+            if (entry.key == key) {
+                found = Some(entry);
+            }
+        }
+        return found;
+    }
+
+    # Appends a parameter read from the file.
+    pub modifier func adopt(edits entry: Entry): void {
+        safe {
+            entry.section = Some(this);
+        }
+        this.body.push(entry);
+        if (entry.indent != "") {
+            this.indent = entry.indent;
+        }
+    }
+
+    # Appends a line that is not a parameter, kept verbatim.
+    pub modifier func keep(line: string): void {
+        this.body.push(line);
+    }
+
+    # Adds a new parameter after the last one, or right after the header
+    # when there is none: the place iniparse gives it. Comments and blank
+    # lines after the last parameter stay below it, with the next section.
+    pub modifier func insert(edits entry: Entry): void {
+        var at = 0;
+        for (k in 0..this.body.len()) {
+            if (this.body[k] is Entry) {
+                at = k + 1;
+            }
+        }
+        safe {
+            entry.section = Some(this);
+        }
+        let tail = this.body.slice(at);
+        var head = this.body.slice(0, at);
+        head.push(entry);
+        this.body = head + tail;
+    }
+
+    # Removes one entry (compared by identity). False when it is not here.
+    pub modifier func remove_entry(entry: Entry): bool {
+        var kept: list[Entry | string] = [];
+        var found = false;
+        for (item in this.body) {
+            if (item is Entry) {
+                if (item == entry) {
+                    found = true;
+                    continue;
+                }
+            }
+            kept.push(item);
+        }
+        this.body = kept;
+        return found;
+    }
+
+    pub func render(): list[string] {
+        var out: list[string] = [];
+        if (this.header != "") {
+            out.push(this.header);
+        }
+        for (item in this.body) {
+            match item {
+                string(text) => {
+                    out.push(text);
+                },
+                _ => {
+                    if (item is Entry) {
+                        for (line in item.render()) {
+                            out.push(line);
+                        }
+                    }
+                },
+            }
+        }
+        return out;
+    }
+
+    # --- Dynamic: the fields of a section are its parameters ---------------
+
+    pub func hasField(name: string): bool {
+        return this.find(name).is_some();
+    }
+
+    # The value of a parameter; "" when there is none (check hasField).
+    pub func getField(name: string): Any {
+        match this.find(name) {
+            Some(entry) => {
+                return entry.full_value;
+            },
+            None => {
+                return "";
+            },
+        }
+    }
+
+    # Sets a parameter: a string is its value; `true` makes it a flag (a
+    # bare name), which an existing parameter does not need to become.
+    # A parameter that is not there yet is inserted after the last one.
+    pub modifier func setField(name: string, value: Any): void {
+        match this.find(name) {
+            Some(entry) => {
+                match value {
+                    string(text) => {
+                        safe {
+                            entry.assign(text, this.separator);
+                        }
+                    },
+                    _ => {},
+                }
+            },
+            None => {
+                var entry = Entry(name = name, indent = this.indent, separator = this.separator, value = "", flag = false);
+                match value {
+                    string(text) => {
+                        safe {
+                            entry.assign(text, this.separator);
+                        }
+                    },
+                    bool(on) => {
+                        safe {
+                            entry.flag = on;
+                        }
+                    },
+                    _ => {
+                        throw TypeError("a parameter value is a string or true, not " + str(value));
+                    },
+                }
+                this.insert(edits: entry);
+            },
+        }
+    }
+
+    # Removes every occurrence of a parameter. False when there was none.
+    pub modifier func deleteField(name: string): bool {
+        let key = name.toLowerCase();
+        var found = false;
+        for (entry in this.entries()) {
+            if (entry.key == key) {
+                this.remove_entry(entry);
+                found = true;
+            }
+        }
+        return found;
+    }
+
+    # Parameter names in the order they first appear, each once, spelled as
+    # their last occurrence.
+    pub func fieldNames(): list[string] {
+        var keys: list[string] = [];
+        var names: dict[string, string] = {};
+        for (entry in this.entries()) {
+            if (!names.containsKey(entry.key)) {
+                keys.push(entry.key);
+            }
+            names[entry.key] = entry.name;
+        }
+        var out: list[string] = [];
+        for (key in keys) {
+            out.push(names[key]);
+        }
+        return out;
+    }
+}

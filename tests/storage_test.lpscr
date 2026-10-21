@@ -1,0 +1,71 @@
+@mode(host.scripted)
+
+# Unit tests for crudini's file access (lib/storage.lpscr): reading lines,
+# replacing a file through a temporary one, and rewriting or appending in
+# place.
+#
+# Runtime: host.scripted, run by the test runner: `make test` interprets
+# this file with Stage0 (`loup-bootstrap test --no-parallel --file`), one
+# test per `func test_*()`. It writes its files under build/tmp/, which the
+# Makefile creates. It is not part of the program.
+
+from debug.assert import (expect, expectEq);
+from io.fs import (writeLines, listDir, createDir, exists);
+from ..lib.storage import (read_problem, write_problem, read_config, text_of, replace_file, rewrite_in_place);
+
+const DIR: string = "build/tmp/storage";
+
+func fresh(name: string, text: string): string {
+    createDir(DIR);
+    let path = DIR + "/" + name;
+    writeText(path, text);
+    return path;
+}
+
+func test_problems(): void {
+    createDir(DIR);
+    expect(read_problem(DIR + "/missing.ini") == Some("No such file or directory"), "missing");
+    expect(read_problem(DIR) == Some("Is a directory"), "directory");
+    expect(read_problem("-").is_none(), "standard input");
+    expect(write_problem(DIR + "/no/such/dir.ini") == Some("No such file or directory"), "no directory");
+    expect(write_problem(DIR + "/new.ini").is_none(), "can be created");
+}
+
+func test_lines_and_text(): void {
+    let path = fresh("lines.ini", "a\nb");
+    expectEq(read_config(path).join("|"), "a|b", "no final newline");
+    expectEq(text_of(["a", "b"]), "a\nb\n", "text");
+    expectEq(text_of([]), "", "empty");
+}
+
+func test_replace(): void {
+    let path = fresh("replace.ini", "[a]\nx = 1\n");
+    replace_file(path, ["[a]", "x = 2"]);
+    expectEq(readText(path), "[a]\nx = 2\n", "new contents");
+    var leftovers = 0;
+    for (name in listDir(DIR)) {
+        if (name.endsWith(".tmp")) {
+            leftovers += 1;
+        }
+    }
+    expectEq(leftovers, 0, "no temporary file left");
+    let created = DIR + "/created.ini";
+    replace_file(created, ["[b]"]);
+    expectEq(readText(created), "[b]\n", "created");
+}
+
+func test_in_place(): void {
+    let path = fresh("inplace.ini", "[a]\nx = 1\n");
+    expect(rewrite_in_place(path, "[a]\nx = 1\n", ["[a]", "x = 1", "y = 2"]), "appended");
+    expectEq(readText(path), "[a]\nx = 1\ny = 2\n", "after append");
+    expect(!rewrite_in_place(path, "[a]\nx = 1\ny = 2\n", ["[a]", "x = 3"]), "rewritten");
+    expectEq(readText(path), "[a]\nx = 3\n", "after rewrite");
+    # The file changed after it was read: no append on top of it.
+    writeText(path, "[a]\nx = 4\n");
+    expect(!rewrite_in_place(path, "[a]\nx = 3\n", ["[a]", "x = 3", "z = 1"]), "changed meanwhile");
+    expectEq(readText(path), "[a]\nx = 3\nz = 1\n", "rewritten whole");
+    # No final newline: appending would glue the new line onto the last.
+    writeText(path, "[a]");
+    expect(!rewrite_in_place(path, "[a]\n", ["[a]", "k = v"]), "no newline at the end");
+    expectEq(readText(path), "[a]\nk = v\n", "rewritten");
+}

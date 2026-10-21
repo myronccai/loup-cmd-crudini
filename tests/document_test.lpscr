@@ -1,0 +1,176 @@
+@mode(host.scripted)
+
+# Unit tests for crudini's document model (lib/document.lpscr,
+# lib/section.lpscr, lib/entry.lpscr): reading and rendering unchanged,
+# lookups with DEFAULT inheritance, structural edits, tidying, and the
+# dynamic and back-pointer access to sections and entries.
+#
+# Runtime: host.scripted, run by the test runner: `make test` interprets
+# this file with Stage0 (`loup-bootstrap test --no-parallel --file`), one
+# test per `func test_*()`. It imports lib/ with relative imports. It is not
+# part of the program.
+
+from debug.assert import (expect, expectEq);
+from data.ini import (parse, hasSection, getValueOrDefault);
+from ..lib.document import (IniDocument, DEFAULT_SECTION);
+from ..lib.section import (Section);
+from ..lib.entry import (Entry);
+from ..lib.errors import (ParseError);
+
+let SAMPLE: list[string] = [
+    "# app",
+    "log = info",
+    "",
+    "[db]",
+    "host = localhost   ; primary",
+    "port:5432",
+    "",
+    "[web]",
+    "msg = first",
+    "  second",
+    "flag",
+    "# end of web",
+    "",
+    "[db]",
+    "PORT = 6432",
+];
+
+func sample(): IniDocument {
+    return IniDocument.read(SAMPLE, "sample.ini", false);
+}
+
+func text(doc: IniDocument): string {
+    return doc.render(false, false).join("\n");
+}
+
+func test_unchanged_round_trip(): void {
+    expectEq(text(sample()), SAMPLE.join("\n"), "every line as read");
+}
+
+func test_bom_and_crlf(): void {
+    let doc = IniDocument.read(["\u{feff}[a]\r", "x = 1\r"], "w.ini", false);
+    expect(doc.bom and doc.crlf, "detected");
+    expectEq(doc.render(false, false).join("|"), "[a]|x = 1", "stripped for parsing");
+    let back = doc.encode(doc.render(false, false));
+    expectEq(back[0], "\u{feff}[a]\r", "put back");
+    expectEq(back[1], "x = 1\r", "CR on every line");
+}
+
+func test_sections_and_lookups(): void {
+    let doc = sample();
+    expectEq(doc.section_names().join(","), "db,web", "each name once");
+    expect(doc.has_defaults(), "log is global");
+    expect(doc.exists(DEFAULT_SECTION) and !doc.exists("nope"), "exists");
+    expectEq(doc.lookup("db", "port").unwrap().full_value, "6432", "the last occurrence wins");
+    expectEq(doc.lookup("web", "LOG").unwrap().full_value, "info", "inherited from DEFAULT");
+    expect(doc.lookup_own("web", "log").is_none(), "not its own");
+    expectEq(doc.lookup("web", "msg").unwrap().full_value, "first\nsecond", "continuation joined");
+    var names: list[string] = [];
+    for (entry in doc.own_entries("db")) {
+        names.push(entry.name);
+    }
+    expectEq(names.join(","), "host,PORT", "first order, last spelling");
+    expect(doc.has_flags(), "flag is a bare name");
+}
+
+func test_section_is_dynamic(): void {
+    let web: Section = sample().target("web");
+    expectEq(web!{msg}, "first\nsecond", "read a field");
+    expect(web.hasField("FLAG"), "case-insensitive");
+    expectEq(web.fieldNames().join(","), "msg,flag", "fields");
+    web!{port} = "8080";
+    safe {
+        web.setField("debug", true);
+    }
+    expectEq(web.render().join("|"), "[web]|msg = first|  second|flag|port = 8080|debug|# end of web|", "inserted after the last parameter");
+    safe {
+        web.deleteField("msg");
+    }
+    expectEq(web.fieldNames().join(","), "flag,port,debug", "deleted with its continuation");
+}
+
+func test_entry_back_pointer(): void {
+    let doc = sample();
+    let host: Entry = doc.lookup("db", "host").unwrap();
+    expectEq(host.section_name(), "db", "knows its section");
+    expect(host.detach(), "removed itself");
+    expect(doc.lookup("db", "host").is_none(), "gone from the document");
+    expect(!host.detach(), "nothing left to remove");
+}
+
+func test_assign_keeps_comment_column(): void {
+    let doc = sample();
+    let host = doc.lookup("db", "host").unwrap();
+    safe {
+        host.assign("db1", " = ");
+    }
+    expectEq(host.render()[0], "host = db1         ; primary", "comment stays in its column");
+    let msg = doc.lookup("web", "msg").unwrap();
+    safe {
+        msg.assign("a\n\nb", " = ");
+    }
+    expectEq(msg.render().join("|"), "msg = a||  b", "continuation indent reused");
+}
+
+func test_add_and_remove_sections(): void {
+    let doc = sample();
+    safe {
+        doc.add_section("cache").setField("size", "64");
+        doc.remove_section("db");
+    }
+    expectEq(doc.render(false, true).join("|"), "# app|log = info||[web]|msg = first|  second|flag|# end of web||[cache]|size = 64", "tidied");
+    expectEq(doc.section_names().join(","), "web,cache", "names");
+}
+
+func test_defaults_header_and_clear(): void {
+    let doc = sample();
+    safe {
+        doc.add_default_header();
+    }
+    expectEq(doc.render(false, false)[0], "[DEFAULT]", "header at the top");
+    safe {
+        doc.clear_defaults();
+    }
+    expect(!doc.has_defaults(), "no global parameters");
+    expectEq(doc.render(false, false)[0], "# app", "header gone, comment kept");
+}
+
+func test_sectionspace(): void {
+    let doc = IniDocument.read(["", "g=1", "[a]", "x=1", "", "", "[b]", ""], "s.ini", false);
+    expectEq(doc.render(true, false).join("|"), "g=1||[a]|x=1||[b]", "one blank line before each header");
+}
+
+func test_use_style(): void {
+    let doc = IniDocument.read(["[a]", "x = 1", "y:2", "flag"], "s.ini", false);
+    safe {
+        doc.use_style(true, "nospace");
+        doc.target("a").setField("z", "3");
+    }
+    expectEq(doc.render(false, false).join("|"), "[a]|x=1|y:2|flag|z=3", "nospace everywhere");
+    safe {
+        doc.use_style(false, "space");
+    }
+    expectEq(doc.render(false, false).join("|"), "[a]|x = 1|y : 2|flag|z = 3", "space everywhere");
+}
+
+func test_parse_error_line(): void {
+    var line = 0;
+    try {
+        IniDocument.read(["[a]", "x = 1", "", "[broken"], "bad.ini", false);
+    } catch (ParseError as e) {
+        line = e.line;
+    }
+    expectEq(line, 4, "line number of the broken header");
+}
+
+# What crudini writes must read back with the standard library's parser.
+func test_output_reads_back_with_data_ini(): void {
+    let doc = sample();
+    safe {
+        doc.add_section("new").setField("key", "value");
+    }
+    let reread = parse(doc.render(false, false).join("\n"));
+    expect(hasSection(reread, "new"), "new section");
+    expectEq(getValueOrDefault(reread, "new", "key", "?"), "value", "new value");
+    expectEq(getValueOrDefault(reread, "db", "PORT", "?"), "6432", "old value");
+}
